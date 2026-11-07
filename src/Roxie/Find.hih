@@ -1,0 +1,121 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The answer of roxie query QUERY: the lines of the collector's
+store that a query of Wolly.Query finds, newest first, as text or as JSON
+of the schema docs/syntax.md gives, with the exit status of the command.
+
+    roxie query 'host:server and level:error'
+    roxie query --json --limit 5 --since 24h '"table is marked"'
+
+The status of an answer says what happened, the same with --json or
+without:
+
+    0   lines found
+    1   the query ran and found none
+    2   the query or --since refused
+    3   more lines in the time window than a query looks at
+    4   the store could not be read
+
+The programme exits with 0 for the status 0 and 1, and with the status
+for the others; the JSON says which in error.kind as well.
+
+--since is N followed by s, m, h, d or w (the window up to now), a day
+YYYY-MM-DD in UTC, or seconds since 1970 (9 to 12 digits); it is joined to the query as
+(QUERY) and time:last N... or (QUERY) and time:[SINCE .. NOW].  Nothing
+of a query is SQL: Wolly.Query reads it, and it binds every value.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+
+module Roxie.Find is
+    """
+    The most lines roxie query shows at once: 100, the most Wolly.Query
+    gives in one call.
+    """
+    function mostShown(): Int64
+        ensures result = 100;
+
+    """
+    The lines roxie query shows without --limit: 20.
+    """
+    function defaultShown(): Int64
+        ensures result = 20;
+
+    """
+    The most lines in the time window of a query that roxie query looks
+    at, as the pages: 1000000.
+    """
+    function mostLinesLooked(): Int64
+        ensures result = 1000000;
+
+    """
+    The version of the schema of the JSON of roxie query: 1.  A change
+    that takes a field away or gives one another meaning makes it 2.
+    """
+    function schemaVersion(): Int64
+        ensures result = 1;
+
+    """
+    The query with the window of since joined to it: the query as it is
+    for an empty since; (query) and time:last N<unit> for N and one of
+    s, m, h, d, w (N of 1 to 9 digits); (query) and time:[since .. now]
+    for a day YYYY-MM-DD or seconds of 9 to 12 digits, so that 24 is no
+    second of 1970 but a mistake.  None for any other since.  (A parser answering an Option: no ensures.)
+    """
+    generic [Q: Region, S: Region]
+    function withSince(query: Span[Nat8, Q], since: Span[Nat8, S], now: Int64): Option[String]
+        requires now >= 0;
+
+    """
+    What roxie query writes and gives back: its exit status (0 to 4, see
+    the head), the text for standard output and the text for standard
+    error.
+    """
+    record Answer: Linear is
+        status: Int32;
+        out: String;
+        err: String;
+    end;
+
+    """
+    The answer to query with since at now, at most limit lines, as JSON
+    of the schema of docs/syntax.md when json, else a line of text a line
+    found: its time, host, level, source and text, between tabs.
+    version is the programme's, a field of the JSON.  The status is 0 to
+    4; with json the JSON goes to out whatever the status, a refusal as
+    its error object, and a line for a person to err.  verbose adds to
+    err, without json, how many lines the query found in all and how many
+    are shown.
+    """
+    generic [R: Region, Q: Region, S: Region, V: Region]
+    function answerQuery(db: &![Database[Writing], R], query: Span[Nat8, Q], since: Span[Nat8, S], now: Int64,
+                         limit: Int64, json: Bool, verbose: Bool, version: Span[Nat8, V]): Answer
+        requires now >= 0
+        requires (limit >= 1) and (limit <= 100)
+        ensures (result.status >= 0) and (result.status <= 4);
+
+    """
+    The answer when the store could not be opened: status 4, with json
+    the JSON of the schema with the error storage.
+    """
+    generic [Q: Region, V: Region]
+    function storageAnswer(query: Span[Nat8, Q], json: Bool, version: Span[Nat8, V]): Answer
+        ensures result.status = 4;
+
+    """
+    Frees an answer.
+
+    No contract: it only frees.
+    """
+    function destroyAnswer(answer: Answer): Unit;
+end module.

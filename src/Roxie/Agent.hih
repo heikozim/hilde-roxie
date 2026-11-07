@@ -1,0 +1,144 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+One round of an agent: the new lines of every
+file into the outbox (Roxie.Outbox), then the batches of the outbox to the
+collector, oldest first, at most mostSends of them.
+
+A batch goes as the body of a POST to the collector's /ingest over mutual
+TLS (Standard.HttpClient.requestAs): the agent shows the certificate and key of its
+configuration, the collector's certificate is checked against the CA file,
+and the token of the host goes with it.  The answer decides: 200 takes the batch out of the
+outbox; 400 sets it aside with the answer (the collector refuses it, and
+sending it again would not change that); anything else, and a request
+that fails, stops the round, and the batch waits for the next.  The
+collector may stand on a private address: its URL is the operator's.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Roxie.Config (
+    AgentConfig
+);
+import Standard.Calendar (
+    Zone
+);
+
+module Roxie.Agent is
+    """
+    The most batches one round sends: 100.
+    """
+    function mostSends(): Int64
+        ensures result = 100;
+
+    """
+    What an answer of the collector does to a batch.
+    """
+    union SendVerdict: Free is
+        """
+        Out of the outbox: the collector has it.
+        """
+        case TakenAway;
+        """
+        Set aside: the collector refuses it.
+        """
+        case PutAside;
+        """
+        Kept, and the round stops: the next round tries again.
+        """
+        case KeptBack;
+    end;
+
+    """
+    The verdict on a batch the collector answered with status.
+
+    No contract: every status has a verdict, there is none to promise.
+    """
+    function verdictOf(status: Nat16): SendVerdict;
+
+    """
+    What a round did: lines put into the outbox, batches taken and set
+    aside, files that could not be read, and whether sending stopped early
+    with a batch kept back (status 0 when the request failed).
+    """
+    record RoundReport: Free is
+        collected: Int64;
+        taken: Int64;
+        setAside: Int64;
+        unreadable: Int64;
+        keptBack: Bool;
+        status: Nat16;
+    end;
+
+    """
+    Whether a round did anything: collected lines, took or set aside a
+    batch, or kept one back.
+    """
+    function movedAnything(report: RoundReport): Bool
+        ensures result = (((report.collected > 0) or (report.taken > 0)) or ((report.setAside > 0) or report.keptBack));
+
+    """
+    What the rounds that moved anything added up to since the agent last
+    said a line of its rounds, and the time it said it.
+    """
+    record Tally: Free is
+        collected: Int64;
+        taken: Int64;
+        setAside: Int64;
+        rounds: Int64;
+        said: Int64;
+    end;
+
+    """
+    The tally of no round, as after a line said at said; said 0 is the
+    start of the agent, before any line.
+    """
+    function freshTally(said: Int64): Tally
+        requires said >= 0
+        ensures (result.rounds = 0) and (result.said = said);
+
+    """
+    tally with the round of report added.
+    """
+    function counted(tally: Tally, report: RoundReport): Tally
+        requires (tally.rounds >= 0) and (tally.rounds < 1000000000)
+        ensures (result.rounds = (tally.rounds + 1)) and (result.said = tally.said);
+
+    """
+    Whether the line of the rounds in tally is said at now, report being
+    the last of them: at once when that round set a batch aside or kept
+    one back; else when the rounds collected lines or took batches, and no
+    line was said yet (said 0), every seconds have passed since the last
+    line, or the clock went back.
+    With every 0 each round that moved anything is said.  A line of the
+    agent is itself a line of the host's log, so a line every round would
+    give the next round a line to send, and so on without end.
+    """
+    function dueAt(tally: Tally, report: RoundReport, now: Int64, every: Int64): Bool
+        requires (now >= 0) and (every >= 0);
+
+    """
+    The token in the file at path: Wolly.Secret.readKey (mode 0600), the
+    line end cut, 64 hex digits; None for anything else.
+
+    No contract: a parser answering an Option.
+    """
+    generic [P: Region]
+    function readToken(path: Span[Nat8, P]): Option[String];
+
+    """
+    One round of the agent of config with the token at now; zone is the
+    zone of the host that wrote the files.
+    """
+    generic [R: Region, C: Region, T: Region, Z: Region]
+    function round(db: &![Database[Writing], R], config: &[AgentConfig, C], token: Span[Nat8, T], zone: &[Zone, Z], now: Int64): RoundReport
+        requires now >= 0;
+end module.

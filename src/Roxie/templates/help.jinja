@@ -1,0 +1,142 @@
+{#
+Part of ROXIE, a log collector on Wolly.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The page of help: the whole query language of the search field, after
+docs/syntax.md.  Every example is a link to its search and one of the
+examples of docs/syntax.md, which src/Roxie/Find.test.hiq runs; the gate
+(scripts/check-syntax.sh) refuses a query here that is none of them, and
+a list of refused queries that is not theirs.  Only the head (top.jinja)
+is drawn from values, escaped there.
+-#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROXIE: help</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+</head>
+<body class="wolly-dashboard">
+<header class="wolly-head">
+<h1><a href="/">ROXIE</a></h1>
+<p>as of <time datetime="{{ generated }}">{{ generated }}</time></p>
+</header>
+{{ top|safe }}
+<main class="roxie-help">
+<h2>The query language</h2>
+<p>The search field finds log lines. A query is made of terms joined by <code>and</code>, <code>or</code> and <code>not</code>:</p>
+<pre><code>host:server and level:error and time:last 24h and "mariadb"</code></pre>
+<p>A query is checked before anything runs. One that is wrong is refused with the reason and the byte where it goes wrong, counted from 0, and the rest of the query is marked from there. A query is never SQL, and text in quotes is never a pattern: every value is taken as written.</p>
+
+<h2 id="terms">Terms</h2>
+<table class="roxie-syntax">
+<thead><tr><th>Term</th><th>Finds</th><th>Values</th></tr></thead>
+<tbody>
+<tr><td><code>host:NAME</code></td><td>the lines of the host NAME</td><td>a host name, in any case; <code>host:web*</code> takes every host whose name begins with <code>web</code>; <code>host:"web1.example.org"</code> in quotes is taken as written</td></tr>
+<tr><td><code>source:PATH</code></td><td>the lines of the file PATH</td><td>1 to 255 bytes, as written and in that case; <code>source:/var/log/hiawatha/*</code> takes every path that begins so; a path with a space or another character outside the list below goes in quotes: <code>source:"/var/log/my app.log"</code></td></tr>
+<tr><td><code>level:LEVEL</code></td><td>the lines of the level</td><td>1 to 16 small letters; ROXIE writes <code>error</code>, <code>warn</code>, <code>info</code> and <code>debug</code>; no prefix</td></tr>
+<tr><td><code>id:N</code></td><td>the line of number N</td><td>1 to 18 digits</td></tr>
+<tr><td><code>time:DAY</code></td><td>the lines of the day</td><td><code>YYYY-MM-DD</code>, a day in UTC</td></tr>
+<tr><td><code>time:N</code></td><td>the lines of that second</td><td>seconds since 1970, 1 to 12 digits</td></tr>
+<tr><td><code>time:"MOMENT"</code></td><td>the lines of that second</td><td><code>"YYYY-MM-DDTHH:MM:SS"</code> or with a final <code>Z</code>, in UTC and in quotes</td></tr>
+<tr><td><code>time:last N</code> and a unit</td><td>the lines from N units ago up to now</td><td>N is 1 to 999999; the unit is <code>s</code> seconds, <code>m</code> minutes, <code>h</code> hours, <code>d</code> days or <code>w</code> weeks: <code>time:last 15m</code>, <code>time:last 7d</code></td></tr>
+<tr><td><code>FIELD:[A .. B]</code></td><td>the lines from A to B, both ends taken</td><td>for <code>time</code> and <code>id</code> only; A and B are values of the field as above; a day as the end takes all of that day; a range that ends before it starts is refused</td></tr>
+<tr><td><code>"WORDS"</code></td><td>the lines that hold these words in this order</td><td>any case; 1 to 16 words of at most 64 bytes each</td></tr>
+</tbody>
+</table>
+<p>The names of the fields and the words <code>and</code>, <code>or</code>, <code>not</code> and <code>last</code> may be written in any case. There is no other field.</p>
+
+<h2 id="text">Text in quotes</h2>
+<p>Text in quotes is cut into words at spaces and at every punctuation mark of ASCII; a word is made of letters, digits and characters beyond ASCII. A line is found when it holds the words one after another, in any case: <code>"table is marked"</code> finds <em>Table is marked as crashed</em>, <code>"marked table"</code> does not. A quote cannot stand inside quotes, and the punctuation inside quotes only separates words, so <code>"mariadb:"</code> is the same as <code>"mariadb"</code>. A term without a field must be in quotes: a bare word is refused.</p>
+
+<h2 id="words">Words outside quotes</h2>
+<p>Outside quotes a value is one word of letters, digits, characters beyond ASCII and <code>. _ / @ * - +</code>. Anything else, a space, a colon, a comma, an apostrophe and the like, ends the word or is refused; such a value goes in quotes. A final <code>*</code> makes a prefix, for <code>host</code> and <code>source</code> only, and only outside quotes.</p>
+
+<h2 id="operators">Operators</h2>
+<table class="roxie-syntax">
+<thead><tr><th>Operator</th><th>Finds</th></tr></thead>
+<tbody>
+<tr><td><code>A and B</code></td><td>the lines that both find</td></tr>
+<tr><td><code>A or B</code></td><td>the lines that either finds</td></tr>
+<tr><td><code>not A</code></td><td>the lines that A does not find</td></tr>
+<tr><td><code>( A )</code></td><td>A, as one term</td></tr>
+</tbody>
+</table>
+<p><code>not</code> binds closest, then <code>and</code>, then <code>or</code>: <code>a or b and c</code> is <code>a or (b and c)</code>, and <code>not a and b</code> is <code>(not a) and b</code>. Two terms need an operator between them; there is no <code>and</code> of its own.</p>
+
+<h2 id="order">Order and pages</h2>
+<p>The lines found come newest first, and the lines of the same second by their number, the newest first. There is no ranking by relevance. A page shows 50 lines; <em>newer</em> and <em>older</em> lead to the pages around it. A search is a link: it can be kept and sent.</p>
+
+<h2 id="limits">Limits</h2>
+<ul>
+<li>A query is at most 1024 bytes.</li>
+<li>Parentheses and <code>not</code> nest at most 16 deep.</li>
+<li>A query has at most 64 terms and operators, and at most 8 texts in quotes.</li>
+<li>A query looks at no more than 1000000 lines in its time window, the times its outermost <code>and</code> joins together. With more it is refused; <code>and time:last 24h</code> makes the window smaller.</li>
+</ul>
+
+<h2 id="examples">Examples</h2>
+<table class="roxie-syntax">
+<thead><tr><th>Query</th><th>Finds</th></tr></thead>
+<tbody>
+<tr><td><a href="/search?q=host%3Aatarax"><code>host:server</code></a></td><td>the lines of the host server, its name in any case</td></tr>
+<tr><td><a href="/search?q=host%3Aweb%2A"><code>host:web*</code></a></td><td>the lines of every host whose name begins with web</td></tr>
+<tr><td><a href="/search?q=host%3A%22web1.example.org%22"><code>host:"web1.example.org"</code></a></td><td>a host in quotes, as written</td></tr>
+<tr><td><a href="/search?q=source%3A%2Fvar%2Flog%2Fhiawatha%2F%2A"><code>source:/var/log/hiawatha/*</code></a></td><td>the lines of every file whose path begins with /var/log/hiawatha/</td></tr>
+<tr><td><a href="/search?q=source%3A%22%2Fvar%2Flog%2Fsyslog%22"><code>source:"/var/log/syslog"</code></a></td><td>a source in quotes, as written</td></tr>
+<tr><td><a href="/search?q=level%3Aerror"><code>level:error</code></a></td><td>the lines of the level error</td></tr>
+<tr><td><a href="/search?q=id%3A3"><code>id:3</code></a></td><td>the line of number 3</td></tr>
+<tr><td><a href="/search?q=id%3A%5B1%20..%202%5D"><code>id:[1 .. 2]</code></a></td><td>the lines of numbers 1 to 2, both ends taken</td></tr>
+<tr><td><a href="/search?q=%22table%20is%20marked%22"><code>"table is marked"</code></a></td><td>the lines with these three words in this order, in any case</td></tr>
+<tr><td><a href="/search?q=level%3Aerror%20and%20host%3Aatarax"><code>level:error and host:server</code></a></td><td>the lines that are both</td></tr>
+<tr><td><a href="/search?q=level%3Aerror%20or%20level%3Awarn"><code>level:error or level:warn</code></a></td><td>the lines that are either</td></tr>
+<tr><td><a href="/search?q=host%3Aatarax%20and%20not%20level%3Ainfo"><code>host:server and not level:info</code></a></td><td>the lines of server that are not info</td></tr>
+<tr><td><a href="/search?q=host%3Aweb1.example.org%20or%20host%3Aatarax%20and%20level%3Aerror"><code>host:web1.example.org or host:server and level:error</code></a></td><td>all lines of web1, and the errors of server: and binds before or</td></tr>
+<tr><td><a href="/search?q=%28host%3Aweb1.example.org%20or%20host%3Aatarax%29%20and%20level%3Aerror"><code>(host:web1.example.org or host:server) and level:error</code></a></td><td>the errors of both hosts</td></tr>
+<tr><td><a href="/search?q=time%3Alast%2024h"><code>time:last 24h</code></a></td><td>the lines of the last 24 hours</td></tr>
+<tr><td><a href="/search?q=time%3Alast%201h%20and%20host%3Aatarax"><code>time:last 1h and host:server</code></a></td><td>the lines of server in the last hour</td></tr>
+<tr><td><a href="/search?q=time%3A2026-10-13"><code>time:2026-10-13</code></a></td><td>the lines of that day, in UTC</td></tr>
+<tr><td><a href="/search?q=time%3A%5B2026-10-13%20..%202026-10-14%5D"><code>time:[2026-10-13 .. 2026-10-14]</code></a></td><td>the lines of both days, the second one whole</td></tr>
+<tr><td><a href="/search?q=time%3A%5B1792022000%20..%201792022400%5D"><code>time:[1792022000 .. 1792022400]</code></a></td><td>a range in seconds since 1970</td></tr>
+<tr><td><a href="/search?q=time%3A%5B%222026-10-14T23%3A55%3A00Z%22%20..%20%222026-10-15T00%3A00%3A00Z%22%5D"><code>time:["2026-10-14T23:55:00Z" .. "2026-10-15T00:00:00Z"]</code></a></td><td>a range of moments, in quotes</td></tr>
+<tr><td><a href="/search?q=host%3Aatarax%20and%20level%3Aerror%20and%20time%3Alast%2024h%20and%20%22mariadb%22"><code>host:server and level:error and time:last 24h and "mariadb"</code></a></td><td>the errors of server in the last day that name mariadb</td></tr>
+</tbody>
+</table>
+
+<h2 id="refused">Refused queries</h2>
+<table class="roxie-syntax">
+<thead><tr><th>Query</th><th>Byte</th><th>The page says</th></tr></thead>
+<tbody>
+<tr class="roxie-refused"><td><code>level:ERROR</code></td><td>6</td><td>a value the field does not take</td></tr>
+<tr class="roxie-refused"><td><code>mariadb</code></td><td>0</td><td>a word without a field; put text in quotes</td></tr>
+<tr class="roxie-refused"><td><code>"crashed</code></td><td>0</td><td>a quote that is not closed</td></tr>
+<tr class="roxie-refused"><td><code>host:server and</code></td><td>15</td><td>a term is missing</td></tr>
+<tr class="roxie-refused"><td><code>host:server level:error</code></td><td>12</td><td>and, or or a closing parenthesis is missing</td></tr>
+<tr class="roxie-refused"><td><code>time:[2026-10-15 .. 2026-10-01]</code></td><td>5</td><td>a range that ends before it starts</td></tr>
+<tr class="roxie-refused"><td><code>colour:red</code></td><td>0</td><td>no such field: host, source, level, time and id are</td></tr>
+</tbody>
+</table>
+<p>The other reasons a query is refused:</p>
+<ul>
+<li>the query is empty</li>
+<li>the query is longer than 1024 bytes</li>
+<li>parentheses and not nest deeper than 16</li>
+<li>more than 64 terms and operators</li>
+<li>more than 8 texts in quotes</li>
+<li>text of more than 16 words, or a word of more than 64 bytes</li>
+<li>a character that is no part of a query; put text in quotes</li>
+<li>a parenthesis that is not closed</li>
+<li>no time: seconds, YYYY-MM-DD or last 24h</li>
+<li>more lines in the time window than a search looks at; add time:last 24h</li>
+</ul>
+
+<h2 id="elsewhere">The same queries elsewhere</h2>
+<p>On the collector, <code>roxie query [--json] [--limit N] [--since SINCE] QUERY...</code> runs the same queries on the command line, and a programme with a reader's token asks <code>GET /api/query?q=QUERY&amp;limit=N&amp;since=SINCE</code>. <code>--since</code> and <code>since</code> take <code>N</code> and a unit as <code>time:last</code> does, a day <code>YYYY-MM-DD</code>, or seconds since 1970 of 9 to 12 digits.</p>
+</main>
+</body>
+</html>

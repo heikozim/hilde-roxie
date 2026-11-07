@@ -1,0 +1,25 @@
+{#
+Part of ROXIE, a log collector on Wolly.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The panels of the hosts: a section for each host with its
+sources over the last 24 hours, every count a link to its search.  The
+rows come ordered by host; the first of a host opens its section.  The
+whole asks for itself again as a panel of Wolly.Dashboard does.  Every
+host and source is escaped: both are the agent's words.
+-#}
+<div class="roxie-hosts" id="panel-hosts" hx-get="/panel/hosts" hx-trigger="every {{ every }}s" hx-swap="outerHTML">
+{% for row in rows %}{% if row.first %}<section class="wolly-panel roxie-host">
+<h2>{{ row.host }}</h2>
+<p><a href="/search?q={{ row.hostQuery }}">{{ row.hostLines }} lines</a>, <a class="roxie-error" href="/search?q={{ row.hostQuery }}%20and%20level%3Aerror">{{ row.hostErrors }} errors</a>, <a class="roxie-warn" href="/search?q={{ row.hostQuery }}%20and%20level%3Awarn">{{ row.hostWarns }} warnings</a> in 24 hours</p>
+<table class="roxie-lines">
+<thead><tr><th>Source</th><th>Lines</th><th>Errors</th><th>Warnings</th><th>Last line</th></tr></thead>
+<tbody>
+{% endif %}<tr><td>{{ row.source }}</td><td><a href="/search?q={{ row.query }}">{{ row.lines }}</a></td><td><a href="/search?q={{ row.query }}%20and%20level%3Aerror">{{ row.errors }}</a></td><td><a href="/search?q={{ row.query }}%20and%20level%3Awarn">{{ row.warns }}</a></td><td><time datetime="{{ row.last }}">{{ row.last }}</time></td></tr>
+{% if row.closes or loop.last %}</tbody>
+</table>
+</section>
+{% endif %}{% else %}<p class="roxie-none">No lines in the last 24 hours.</p>
+{% endfor %}</div>

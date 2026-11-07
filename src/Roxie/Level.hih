@@ -1,0 +1,34 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The level of a log line as the agent guesses it from its words, until the
+agent parses lines with Standard.PcreJit.  A word is a run of
+letters and digits; it counts in any case.
+
+    error   error, err, errors, fail, failed, failure, fatal, crit,
+            critical, alert, emerg, emergency, panic
+    warn    warn, warning, warnings
+    debug   debug, trace
+    info    every other line
+
+The most severe word wins: a line with "warning" and "failed" is error.
+A word that counts nothing is none: "0 failed" with no letter or
+digit before the 0, "failed: 0", "errors=0".
+"""
+import Wolly.LogStore (
+    isLevel
+);
+
+
+module Roxie.Level is
+    """
+    error, warn, debug or info for text; each a level of Wolly.LogStore.
+    """
+    generic [T: Region]
+    function guessLevel(text: Span[Nat8, T]): Span[Nat8, Static]
+        ensures isLevel(result);
+end module.

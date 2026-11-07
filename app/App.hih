@@ -1,0 +1,53 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The programme roxie, its command line declared with
+Standard.Arguments:
+
+    roxie                      the collector, a FastCGI responder behind
+                               Hiawatha on the socket of --socket,
+                               ROXIE_SOCKET or /run/roxie/roxie.sock
+    roxie serve SOCKET         the same on the socket at SOCKET, an absolute path
+                               of at most 100 bytes (a directory of its own, as
+                               /run/roxie/roxie.sock)
+    roxie allow NAME SUB       the account SUB of RAMBO signs in as the user
+                               NAME
+    roxie revoke-user NAME     no account of RAMBO signs in as NAME any more
+    roxie token HOST           a token for the agent of HOST, shown once
+    roxie revoke HOST          revokes the tokens of HOST
+    roxie agent CONFIG         the agent: a round every few seconds until
+                               SIGTERM or SIGINT
+    roxie agent-once CONFIG    one round of the agent, then exit
+    roxie prune DAYS           takes lines and samples older than DAYS days
+                               out of the store, 1 to 36500
+    roxie relevel              gives every kept line the level of today's
+                               rules, beside the running collector
+
+    roxie query QUERY...       the lines QUERY finds, newest first, as text
+                               or with --json as JSON; --limit N, --since
+                               SINCE (docs/syntax.md)
+    roxie doctor               checks the files of the collector in the
+                               working directory and its socket
+
+and what Standard.Arguments builds in: -h, --help and help, -V, --version
+and version (--full), info, -v, -s and sandbox, setup completion bash|zsh|
+fish and setup manual, and for a word nearly right the word meant.
+
+The collector works in its working directory: roxie.db, csrf.key,
+pseudonym.key, audit.log, access.log, known-passwords.txt, and rambo.conf
+and rambo-secret of the sign-in through RAMBO.
+"""
+
+module Roxie.App is
+    """
+    The programme.
+
+    No contract: what it does is its exit status and its output, none a
+    condition could check in O(1).
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

@@ -1,0 +1,168 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Configurations read whole, and refused with the number of their line.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nthRef
+);
+import Roxie.Config (
+    ConfigProblem,
+    ConfigError,
+    AgentConfig,
+    mostFiles,
+    defaultReport,
+    mostReport,
+    readConfig,
+    destroyConfig,
+    configProblemName
+);
+
+module body Roxie.Config.Test is
+    constant good: Span[Nat8, Static] := "# the agent of server\ncollector https://logs.example.org/ingest\nca /etc/roxie/ca.pem\ncertificate /etc/roxie/agent.pem\nkey /etc/roxie/agent.key\n\ntoken /etc/roxie/token\nstate /var/db/roxie/agent.db\nevery 10\nfile /var/log/messages\n  file\t/var/log/nginx/error.log  \r\n";
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region]
+    function refused(text: Span[Nat8, T], line: Index, problem: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case readConfig(text) of
+            when Right(right as config: AgentConfig) do
+                destroyConfig(config);
+                assertTrue(false, message);
+            when Left(left as error: ConfigError) do
+                let fit: Bool := (error.line = line) and equal(configProblemName(error.problem), problem);
+                if not fit then
+                    printLn(configProblemName(error.problem));
+                end if;
+                assertTrue(fit, message);
+        end case;
+        return nil;
+    end;
+
+    function testRead(): Unit is
+        assertTrue(mostFiles() = 64, "64 files");
+        case readConfig(good) of
+            when Right(right as config: AgentConfig) do
+                let { collector as a: String, ca as b: String, certificate as g: String, key as h: String, token as c: String,
+                      state as d: String, every as e: Int64, report as r: Int64, files as f: Buffer[String] } := config;
+                assertTrue(equal(asSpan(&a), "https://logs.example.org/ingest"), "the collector");
+                assertTrue(equal(asSpan(&b), "/etc/roxie/ca.pem"), "the CA file");
+                assertTrue(equal(asSpan(&g), "/etc/roxie/agent.pem"), "the agent's certificate");
+                assertTrue(equal(asSpan(&h), "/etc/roxie/agent.key"), "the agent's key");
+                assertTrue(equal(asSpan(&c), "/etc/roxie/token"), "the token file");
+                assertTrue(equal(asSpan(&d), "/var/db/roxie/agent.db"), "the state");
+                assertTrue(e = 10, "every 10 seconds");
+                assertTrue(r = 600, "no report: a line of the rounds every 600 seconds");
+                assertTrue(length(&f) = 2, "two files");
+                assertTrue(equal(asSpan(nthRef(&f, 1)), "/var/log/nginx/error.log"), "a file between spaces, a tab and a carriage return");
+                destroyConfig(AgentConfig(collector => a, ca => b, certificate => g, key => h, token => c, state => d, every => e,
+                                          report => r, files => f));
+            when Left(left as error: ConfigError) do
+                printLn(configProblemName(error.problem));
+                assertTrue(false, "a good configuration");
+        end case;
+        return nil;
+    end;
+
+    -- The report of text, the good configuration with one more line.
+    generic [T: Region]
+    function reportOf(line: Span[Nat8, T]): Int64 is
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, good);
+        writeString(&!text, line);
+        let made: String := finalize(text);
+        var got: Int64 := -1;
+        case readConfig(asSpan(&made)) of
+            when Right(right as config: AgentConfig) do
+                got := config.report;
+                destroyConfig(config);
+            when Left(left as error: ConfigError) do
+                printLn(configProblemName(error.problem));
+        end case;
+        destroyString(made);
+        return got;
+    end;
+
+    function testReport(): Unit is
+        assertTrue(defaultReport() = 600, "600 seconds when report is left out");
+        assertTrue(mostReport() = 86400, "a day at most");
+        assertTrue(reportOf("report 0\n") = 0, "report 0: every round");
+        assertTrue(reportOf("report 3600\n") = 3600, "report 3600");
+        assertTrue(reportOf("report 86400\n") = 86400, "report 86400, the most");
+        assertTrue(reportOf("") = 600, "no report");
+        refused("report 86401\n", 1, "BadSetting", "report 86401");
+        refused("report -1\n", 1, "BadSetting", "report below 0");
+        refused("report 100000\n", 1, "BadSetting", "report of six digits");
+        refused("report 0086400\n", 1, "BadSetting", "report of seven digits, though its number fits");
+        refused("report soon\n", 1, "BadSetting", "report of no number");
+        refused("report 60\nreport 60\n", 2, "GivenTwice", "report twice");
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        refused("", 0, "MissingSetting", "empty");
+        refused("collector https://a.example/ingest\nca /c\ncertificate /e\nkey /k\ntoken /t\nstate /s\nevery 10\n", 0, "MissingSetting", "no file");
+        refused("ca /c\ncertificate /e\nkey /k\ntoken /t\nstate /s\nevery 10\nfile /f\n", 0, "MissingSetting", "no collector");
+        refused("collector https://a.example/ingest\nca /c\ncertificate /e\nkey /k\ntoken /t\nstate /s\nfile /f\n", 0, "MissingSetting", "no every");
+        refused("collector https://a.example/ingest\nca /c\nkey /k\ntoken /t\nstate /s\nevery 10\nfile /f\n", 0, "MissingSetting", "no certificate");
+        refused("collector https://a.example/ingest\nca /c\ncertificate /e\ntoken /t\nstate /s\nevery 10\nfile /f\n", 0, "MissingSetting", "no key");
+        refused("certificate /e\ncertificate /f\n", 2, "GivenTwice", "two certificates");
+        refused("key /k\nkey /l\n", 2, "GivenTwice", "two keys");
+        refused("certificate agent.pem\n", 1, "BadSetting", "a relative certificate");
+        refused("key agent.key\n", 1, "BadSetting", "a relative key");
+        refused("collector\n", 1, "NotASetting", "a name without a value");
+        refused("\n\nwhatever /x\n", 3, "UnknownSetting", "an unknown setting on line 3");
+        refused("Collector https://a.example/ingest\n", 1, "UnknownSetting", "names in small letters");
+        refused("collector http://a.example/ingest\n", 1, "BadSetting", "http without TLS");
+        refused("collector https://user@a.example/ingest\n", 1, "BadSetting", "user information in the URL");
+        refused("collector https://a.example/i\ncollector https://b.example/i\n", 2, "GivenTwice", "two collectors");
+        refused("ca c.pem\n", 1, "BadSetting", "a relative path");
+        refused("every 0\n", 1, "BadSetting", "every 0");
+        refused("every 3601\n", 1, "BadSetting", "every 3601");
+        refused("every -5\n", 1, "BadSetting", "every below 0");
+        refused("every 10\nevery 20\n", 2, "GivenTwice", "every twice");
+        refused("file /var/log/a\tb\n", 1, "BadSetting", "a tab inside a path");
+        var many: StringBuilder := makeStringBuilder();
+        writeString(&!many, "collector https://a.example/ingest\nca /c\ncertificate /e\nkey /k\ntoken /t\nstate /s\nevery 10\n");
+        var i: Index := 0;
+        while i < 65 do
+            writeString(&!many, "file /var/log/x\n");
+            i := i + 1;
+        end while;
+        let text: String := finalize(many);
+        refused(asSpan(&text), 72, "TooManyFiles", "65 files");
+        destroyString(text);
+        return nil;
+    end;
+end module body.

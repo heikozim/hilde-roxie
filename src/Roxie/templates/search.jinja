@@ -1,0 +1,37 @@
+{#
+Part of ROXIE, a log collector on Wolly.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The page of a search: the head (top.jinja, escaped there), why a query is
+refused, or the lines found with links to the pages before and after.
+Every value of a line is escaped; a line is a visitor's text.
+-#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROXIE: {{ query }}</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+</head>
+<body class="wolly-dashboard">
+<header class="wolly-head">
+<h1><a href="/">ROXIE</a></h1>
+<p>as of <time datetime="{{ generated }}">{{ generated }}</time></p>
+</header>
+{{ top|safe }}
+{% if problem %}<p class="roxie-problem">{{ problem }}, at byte {{ position }}: <code>{{ before }}<mark>{{ after }}</mark></code></p>
+{% endif %}{% if searched %}<p class="roxie-count">{{ total }} lines{% if shown > 0 %}, {{ firstShown }} to {{ lastShown }} shown{% endif %}</p>
+<table class="roxie-lines">
+<thead><tr><th>Time</th><th>Host</th><th>Level</th><th>Source</th><th>Line</th></tr></thead>
+<tbody>
+{% for line in lines %}<tr class="roxie-{{ line.level }}"><td><time datetime="{{ line.time }}">{{ line.time }}</time></td><td>{{ line.host }}</td><td>{{ line.level }}</td><td>{{ line.source }}</td><td><code>{{ line.text }}</code></td></tr>
+{% endfor %}</tbody>
+</table>
+<nav class="roxie-pages">{% if newer >= 0 %}<a href="/search?q={{ query }}&amp;offset={{ newer }}">newer</a> {% endif %}{% if older >= 0 %}<a href="/search?q={{ query }}&amp;offset={{ older }}">older</a>{% endif %}</nav>
+{% endif %}</body>
+</html>

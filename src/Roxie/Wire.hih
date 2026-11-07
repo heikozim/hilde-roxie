@@ -1,0 +1,194 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What an agent sends the collector: one batch in the body of a POST to
+/ingest.
+
+    roxie 1 <batch>\n
+    <at>\t<level>\t<source>\t<text>\n
+    ...
+
+batch is the number of the batch at its agent, 1 or more and growing, so
+the collector can tell a batch it kept already from a new one.  at is the
+time the agent read the line, seconds since 1970 (1 to 12 digits); level
+is a level of Wolly.LogStore (isLevel), source the file it came from
+(isSource, so no tab in it), and text the line as it was, without its
+line end, with no control byte but the tab.  Every line ends with a line
+end, the last one too.  The host is not in the batch: the collector takes
+it from the token the batch came with.
+
+A batch is read whole or refused whole, with the number of the line that
+is wrong (0 the first line, the header).  Agent and collector use this
+module both, so an agent sends nothing the collector refuses.
+"""
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Roxie.Wire is
+    """
+    The most lines of a batch: 1000.
+    """
+    function mostBatchLines(): Index
+        ensures result = 1000;
+
+    """
+    The most bytes of a batch: 1 MiB.
+    """
+    function mostBatchBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The most bytes of the text of a line: 16384, as Wolly.LogStore keeps.
+    """
+    function mostTextBytes(): Index
+        ensures result = 16384;
+
+    """
+    How far the time of a line may lie after the collector's now: 300
+    seconds, for clocks that differ a little.
+    """
+    function mostSkew(): Int64
+        ensures result = 300;
+
+    """
+    What is wrong with a batch.
+    """
+    union WireProblem: Free is
+        """
+        More than mostBatchBytes bytes.
+        """
+        case BatchTooLarge;
+        """
+        The first line is not roxie 1 and a batch number.
+        """
+        case NoBatchHeader;
+        """
+        No line after the header.
+        """
+        case NoLines;
+        """
+        More than mostBatchLines lines.
+        """
+        case TooManyBatchLines;
+        """
+        The last line has no line end.
+        """
+        case NoLineEnd;
+        """
+        A line with fewer than four fields.
+        """
+        case MissingField;
+        """
+        A time that is no number of 1 to 12 digits.
+        """
+        case BadLineTime;
+        """
+        A time more than mostSkew seconds after now.
+        """
+        case FutureTime;
+        """
+        A level that is none.
+        """
+        case BadLevel;
+        """
+        A source that is none.
+        """
+        case BadSource;
+        """
+        A text with a control byte other than the tab, or longer than
+        mostTextBytes.
+        """
+        case BadText;
+    end;
+
+    """
+    A refused batch: the problem and the number of its line, 0 for the
+    header.
+    """
+    record WireError: Free is
+        line: Index;
+        problem: WireProblem;
+    end;
+
+    """
+    The name of problem as the union names it, for an answer to the agent.
+    """
+    function problemName(problem: WireProblem): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    One line of a batch: its time, and where its level, source and text
+    lie in the data, each from start to before stop.
+    """
+    record WireLine: Free is
+        at: Int64;
+        levelStart: Index;
+        levelStop: Index;
+        sourceStart: Index;
+        sourceStop: Index;
+        textStart: Index;
+        textStop: Index;
+    end;
+
+    """
+    A batch that was read: its number and its lines.
+    """
+    record Batch: Linear is
+        number: Int64;
+        lines: Buffer[WireLine];
+    end;
+
+    """
+    The batch in data, or why it is refused.  now is the collector's time.
+    (A parser of foreign input: its result is an Either, no ensures.)
+    """
+    generic [B: Region]
+    function readBatch(data: Span[Nat8, B], now: Int64): Either[WireError, Batch]
+        requires now >= 0;
+
+    """
+    Frees a batch.
+
+    No contract: it only frees.
+    """
+    function destroyBatch(batch: Batch): Unit;
+
+    """
+    The first line of the batch number: roxie 1 number and a line end.
+    """
+    function batchHeader(number: Int64): String
+        requires number >= 1;
+
+    """
+    Writes one line of a batch to out and answers true; false, and nothing
+    written, when at is below 0 or has more than 12 digits, level is no
+    level or source no source.  Each control byte of text but the tab is
+    written as a space, and text is cut after mostTextBytes bytes.
+
+    No contract: it checks at, level and source itself and says so with
+    false, and its answer is no property of out to promise.
+    """
+    generic [R: Region, L: Region, S: Region, T: Region]
+    function writeLine(out: &![StringBuilder, R], at: Int64, level: Span[Nat8, L], source: Span[Nat8, S],
+                       text: Span[Nat8, T]): Bool;
+
+    """
+    The most bytes writeLine writes for a line of these lengths: 12 digits
+    of time, three tabs, the level, the source, the text cut to
+    mostTextBytes, and the line end.
+    """
+    function lineSize(level_bytes: Index, source_bytes: Index, text_bytes: Index): Index
+        requires (level_bytes <= 16) and (source_bytes <= 255)
+        ensures result >= ((level_bytes + source_bytes) + 16);
+end module.

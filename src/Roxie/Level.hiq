@@ -1,0 +1,130 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- One pass over the line: each word is compared, in small letters, with
+-- the words of the levels, and the most severe level found is kept.  A
+-- word longer than the longest of them is skipped without a comparison.
+
+module body Roxie.Level is
+    constant word_most: Index := 9;
+    constant info_rank: Nat8 := 0;
+    constant debug_rank: Nat8 := 1;
+    constant warn_rank: Nat8 := 2;
+    constant error_rank: Nat8 := 3;
+
+    function isWordByte(byte: Nat8): Bool is
+        return (((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'))) or ((byte >= '0') and (byte <= '9'));
+    end;
+
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    -- Whether the word from first to before stop is word, in any case.
+    generic [T: Region]
+    function wordIs(text: Span[Nat8, T], first: Index, stop: Index, word: Span[Nat8, Static]): Bool is
+        if (stop - first) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if lower(text[first + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region]
+    function rankOf(text: Span[Nat8, T], first: Index, stop: Index): Nat8 is
+        if ((wordIs(text, first, stop, "error") or wordIs(text, first, stop, "err")) or (wordIs(text, first, stop, "errors") or wordIs(text, first, stop, "fail"))) then
+            return error_rank;
+        end if;
+        if ((wordIs(text, first, stop, "failed") or wordIs(text, first, stop, "failure")) or (wordIs(text, first, stop, "fatal") or wordIs(text, first, stop, "crit"))) then
+            return error_rank;
+        end if;
+        if ((wordIs(text, first, stop, "critical") or wordIs(text, first, stop, "alert")) or (wordIs(text, first, stop, "emerg") or wordIs(text, first, stop, "emergency"))) then
+            return error_rank;
+        end if;
+        if wordIs(text, first, stop, "panic") then
+            return error_rank;
+        end if;
+        if (wordIs(text, first, stop, "warn") or wordIs(text, first, stop, "warning")) or wordIs(text, first, stop, "warnings") then
+            return warn_rank;
+        end if;
+        if wordIs(text, first, stop, "debug") or wordIs(text, first, stop, "trace") then
+            return debug_rank;
+        end if;
+        return info_rank;
+    end;
+
+    -- Whether the word from first to before stop counts nothing:
+    -- "0 failed" with no letter or digit before the 0, or "failed: 0",
+    -- "failed:      0", "errors=0" with none after it.
+    generic [T: Region]
+    function zeroCount(text: Span[Nat8, T], first: Index, stop: Index): Bool is
+        let size: Index := spanLength(text);
+        if (first >= 2) and ((text[first - 1] = ' ') and (text[first - 2] = '0')) then
+            if (first = 2) or (not isWordByte(text[first - 3])) then
+                return true;
+            end if;
+        end if;
+        var at: Index := stop;
+        if (at < size) and (text[at] = ':') then
+            at := at + 1;
+            while (at < size) and (text[at] = ' ') do
+                at := at + 1;
+            end while;
+        else
+            if (at < size) and (text[at] = '=') then
+                at := at + 1;
+            else
+                return false;
+            end if;
+        end if;
+        if (at >= size) or (text[at] /= '0') then
+            return false;
+        end if;
+        return ((at + 1) = size) or (not (isWordByte(text[at + 1]) or (text[at + 1] = '.')));
+    end;
+
+    generic [T: Region]
+    function guessLevel(text: Span[Nat8, T]): Span[Nat8, Static] is
+        let size: Index := spanLength(text);
+        var best: Nat8 := info_rank;
+        var i: Index := 0;
+        while (i < size) and (best < error_rank) do
+            if isWordByte(text[i]) then
+                let first: Index := i;
+                while (i < size) and isWordByte(text[i]) do
+                    i := i + 1;
+                end while;
+                if (i - first) <= word_most then
+                    let rank: Nat8 := rankOf(text, first, i);
+                    if (rank > best) and (not zeroCount(text, first, i)) then
+                        best := rank;
+                    end if;
+                end if;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        if best = error_rank then
+            return "error";
+        end if;
+        if best = warn_rank then
+            return "warn";
+        end if;
+        if best = debug_rank then
+            return "debug";
+        end if;
+        return "info";
+    end;
+end module body.

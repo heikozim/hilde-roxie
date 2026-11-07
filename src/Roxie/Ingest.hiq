@@ -1,0 +1,741 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    commit,
+    rollback
+);
+import Standard.Task (
+    sleepFor
+);
+import Standard.Search (
+    SearchError
+);
+import Standard.FcgiServer (
+    Request,
+    requestBody,
+    requestParam
+);
+import Wolly.Net (
+    validHostname
+);
+import Wolly.LogStore (
+    prepareLogStore,
+    keepLineIn,
+    setLevelIn,
+    pruneLines
+);
+import Wolly.Bearer (
+    prepareTokens,
+    bearerToken,
+    tokenOwner,
+    unauthorized
+);
+import Wolly.Metrics (
+    prepareMetrics,
+    recordMetric,
+    pruneMetrics
+);
+import Wolly.Request (
+    requestMethod
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish as respond,
+    decimalText
+);
+import Roxie.Line (
+    lineLevel
+);
+import Roxie.Wire (
+    WireError,
+    WireLine,
+    Batch,
+    readBatch,
+    destroyBatch,
+    problemName
+);
+
+module body Roxie.Ingest is
+    constant prune_steps_most: Int64 := 10000;
+    constant prune_rest: Nat32 := 20;
+    constant make_batches: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS roxie_batches (host TEXT PRIMARY KEY, number INTEGER NOT NULL CHECK (number >= 1), kept INTEGER NOT NULL CHECK (kept >= 0)) STRICT";
+    constant get_batch: Span[Nat8, Static] := "SELECT number, kept FROM roxie_batches WHERE host = ?";
+    constant put_batch: Span[Nat8, Static] := "INSERT INTO roxie_batches (host, number, kept) VALUES (?, ?, ?) ON CONFLICT (host) DO UPDATE SET number = excluded.number, kept = excluded.kept";
+    -- relevelLines reads and writes Wolly.LogStore's tables and
+    -- the title of Standard.Search's rows, which is "host source level".
+    constant relevel_step: Int64 := 1000;
+    -- The most lines of relevel in one transaction: at about 0.1 s a
+    -- line looked up by key in the index of server, about a second of the
+    -- write lock, under the 5 s a batch of the collector waits for it.
+    constant relevel_write_most: Index := 10;
+    constant lines_after: Span[Nat8, Static] := "SELECT id, level, line FROM wolly_log_lines WHERE id > ? ORDER BY id LIMIT ?";
+
+    -- Where a host is: the number of its batch and how many lines of it
+    -- are kept; number 0 for a host never seen.
+    record Position: Free is
+        number: Int64;
+        kept: Int64;
+    end;
+
+    -- What a batch left: lines kept, of them errors, and whether it went
+    -- through to its end.
+    record Tally: Free is
+        lines: Int64;
+        errors: Int64;
+        whole: Bool;
+    end;
+
+    -- One step of relevelLines: lines read, lines changed, the last id read.
+    record RelevelStep: Free is
+        seen: Int64;
+        changed: Int64;
+        last: Int64;
+    end;
+
+    generic [R: Region]
+    function prepareIngest(db: &![Database[Writing], R]): Bool is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                return false;
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        case prepareTokens(&~db) of
+            when Some(value as error: DbError) do
+                return false;
+            when None do
+                skip;
+        end case;
+        case prepareMetrics(&~db) of
+            when Some(value as error: DbError) do
+                return false;
+            when None do
+                skip;
+        end case;
+        case execute(&~db, make_batches, noValues()) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as made: Nat64) do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region, H: Region]
+    function positionOf(db: &![Database[Writing], R], host: Span[Nat8, H]): Either[DbError, Position] is
+        var cursor: Cursor := start(&~db, get_batch, withText(noValues(), host));
+        var number: Int64 := 0;
+        var kept: Int64 := 0;
+        if advance(&!cursor) then
+            number := columnInt64(&cursor, 0);
+            kept := columnInt64(&cursor, 1);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => Position(number => number, kept => kept));
+        end case;
+    end;
+
+    function wide(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(i: Int64): Index is
+        case toIndex(i) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region]
+    function isError(level: Span[Nat8, A]): Bool is
+        if spanLength(level) /= 5 then
+            return false;
+        end if;
+        return ((level[0] = 'e') and (level[1] = 'r')) and (((level[2] = 'r') and (level[3] = 'o')) and (level[4] = 'r'));
+    end;
+
+    -- Adds value to the metric name at now.  A metric that is not kept
+    -- costs the dashboard a count and nothing else, so it does not fail
+    -- the batch.
+    generic [R: Region]
+    function count(db: &![Database[Writing], R], name: Span[Nat8, Static], now: Int64, value: Int64): Unit is
+        case recordMetric(&~db, name, now, value) of
+            when Left(left as error: DbError) do
+                skip;
+            when Right(right as kept: Bool) do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Keeps the lines of batch from first on in the open transaction
+    -- through Wolly.LogStore's keepLineIn, and after each the
+    -- position of host.
+    generic [R: Region, X: Region, H: Region, D: Region, B: Region]
+    function keepFrom(db: &![Database[Writing], R], transaction: &[Transaction, X], host: Span[Nat8, H],
+                      data: Span[Nat8, D], batch: &[Batch, B], first: Index): Tally is
+        let lines: &[Buffer[WireLine], B] := &(batch->lines);
+        let number: Int64 := batch->number;
+        var kept: Int64 := 0;
+        var errors: Int64 := 0;
+        var going: Bool := true;
+        var i: Index := first;
+        while going and (i < length(lines)) do
+            let line: WireLine := nth(lines, i);
+            let level: Span[Nat8, D] := substring(data, line.levelStart, line.levelStop);
+            let source: Span[Nat8, D] := substring(data, line.sourceStart, line.sourceStop);
+            let text: Span[Nat8, D] := substring(data, line.textStart, line.textStop);
+            case keepLineIn(&~db, transaction, host, source, line.at, level, text) of
+                when Left(left as failure: SearchError) do
+                    going := false;
+                when Right(right as id: Option[Int64]) do
+                    case id of
+                        when None do
+                            going := false;
+                        when Some(value as stored: Int64) do
+                            kept := kept + 1;
+                            if isError(level) then
+                                errors := errors + 1;
+                            end if;
+                            case execute(&~db, put_batch, withInt64(withInt64(withText(noValues(), host), number), wide(i + 1))) of
+                                when Left(left as error: DbError) do
+                                    going := false;
+                                when Right(right as put: Nat64) do
+                                    skip;
+                            end case;
+                    end case;
+            end case;
+            i := i + 1;
+        end while;
+        return Tally(lines => kept, errors => errors, whole => going);
+    end;
+
+    generic [R: Region, H: Region, D: Region, B: Region]
+    function keepBatch(db: &![Database[Writing], R], host: Span[Nat8, H], data: Span[Nat8, D], batch: &[Batch, B],
+                       now: Int64): IngestOutcome is
+        let number: Int64 := batch->number;
+        let total: Int64 := wide(length(&(batch->lines)));
+        case positionOf(&~db, host) of
+            when Left(left as error: DbError) do
+                return IngestStorage(step => "the position of the host", code => error.code);
+            when Right(right as position: Position) do
+                if number < position.number then
+                    return Repeated();
+                end if;
+                var first: Int64 := 0;
+                if number = position.number then
+                    first := position.kept;
+                end if;
+                if first >= total then
+                    return Repeated();
+                end if;
+                -- One transaction for the batch: one commit in place
+                -- of several a line.  A line that fails takes the batch back;
+                -- the position stays, and the agent sends it again.
+                case begin(&~db) of
+                    when Left(left as error: DbError) do
+                        return IngestStorage(step => "the begin of its transaction", code => error.code);
+                    when Right(right as open: Transaction) do
+                        let tally: Tally := keepFrom(&~db, &open, host, data, batch, narrow(first));
+                        if not tally.whole then
+                            rollback(&~db, open);
+                            return IngestStorage(step => "a line", code => 0);
+                        else
+                            count(&~db, "roxie.batches", now, 1);
+                            count(&~db, "roxie.lines", now, tally.lines);
+                            count(&~db, "roxie.errors", now, tally.errors);
+                            case commit(&~db, open) of
+                                when Left(left as error: DbError) do
+                                    return IngestStorage(step => "the commit", code => error.code);
+                                when Right(right as done: Unit) do
+                                    return Kept(count => tally.lines);
+                            end case;
+                        end if;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, H: Region, D: Region]
+    function ingest(db: &![Database[Writing], R], host: Span[Nat8, H], data: Span[Nat8, D], now: Int64): IngestOutcome is
+        if not validHostname(host) then
+            return NotAHost();
+        end if;
+        case readBatch(data, now) of
+            when Left(left as error: WireError) do
+                count(&~db, "roxie.refused", now, 1);
+                return BadBatch(reason => error);
+            when Right(right as batch: Batch) do
+                let outcome: IngestOutcome := keepBatch(&~db, host, data, &batch, now);
+                destroyBatch(batch);
+                return outcome;
+        end case;
+    end;
+
+    function mostPruneSteps(): Int64 is
+        return prune_steps_most;
+    end;
+
+    generic [R: Region]
+    function pruneBefore(db: &![Database[Writing], R], before: Int64): PruneReport is
+        var lines: Int64 := 0;
+        var steps: Int64 := 0;
+        var going: Bool := true;
+        var whole: Bool := true;
+        while going and (steps < prune_steps_most) do
+            -- A step in one transaction, as a batch is kept.
+            case begin(&~db) of
+                when Left(left as error: DbError) do
+                    whole := false;
+                    going := false;
+                when Right(right as open: Transaction) do
+                    case pruneLines(&~db, before) of
+                        when Right(right as taken: Int64) do
+                            case commit(&~db, open) of
+                                when Left(left as error: DbError) do
+                                    whole := false;
+                                    going := false;
+                                when Right(right as done: Unit) do
+                                    lines := lines + taken;
+                                    if taken = 0 then
+                                        going := false;
+                                    else
+                                        -- The store is free between two steps, so a
+                                        -- batch whose begin waits gets in.
+                                        sleepFor(prune_rest);
+                                    end if;
+                            end case;
+                        when Left(left as failure: SearchError) do
+                            rollback(&~db, open);
+                            whole := false;
+                            going := false;
+                    end case;
+            end case;
+            steps := steps + 1;
+        end while;
+        if going then
+            whole := false;
+        end if;
+        var samples: Int64 := 0;
+        case pruneMetrics(&~db, before) of
+            when Right(right as taken: Nat64) do
+                case toInt64(taken) of
+                    when Some(value as removed: Int64) do
+                        samples := removed;
+                    when None do
+                        skip;
+                end case;
+            when Left(left as error: DbError) do
+                whole := false;
+        end case;
+        return PruneReport(lines => lines, samples => samples, whole => whole);
+    end;
+
+    -- A level as a number, to keep it in a buffer, and back.
+    generic [L: Region]
+    function levelCode(level: Span[Nat8, L]): Nat8 is
+        if (spanLength(level) = 5) and (level[0] = 'e') then
+            return 3;
+        end if;
+        if (spanLength(level) = 4) and (level[0] = 'w') then
+            return 2;
+        end if;
+        if (spanLength(level) = 5) and (level[0] = 'd') then
+            return 0;
+        end if;
+        return 1;
+    end;
+
+    function levelName(code: Nat8): Span[Nat8, Static] is
+        if code = 3 then
+            return "error";
+        end if;
+        if code = 2 then
+            return "warn";
+        end if;
+        if code = 0 then
+            return "debug";
+        end if;
+        return "info";
+    end;
+
+    -- The level stored for a line, as a number; 9 for none of the four.
+    generic [L: Region]
+    function storedCode(level: Span[Nat8, L]): Nat8 is
+        let code: Nat8 := levelCode(level);
+        if not sameText(level, levelName(code)) then
+            return 9;
+        end if;
+        return code;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameText(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The lines of ids from first, at most relevel_write_most of them, their
+    -- new levels in one transaction of their own through Wolly.LogStore's
+    -- setLevelIn; the write lock is held that long and no longer
+    --.  Whether they went through.
+    generic [R: Region, I: Region, C: Region]
+    function relevelSome(db: &![Database[Writing], R], ids: &[Buffer[Int64], I], codes: &[Buffer[Nat8], C], first: Index): Bool is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as open: Transaction) do
+                var going: Bool := true;
+                var i: Index := first;
+                while going and ((i < length(ids)) and ((i - first) < relevel_write_most)) do
+                    case setLevelIn(&~db, &open, nth(ids, i), levelName(nth(codes, i))) of
+                        when Left(left as failure: SearchError) do
+                            going := false;
+                        when Right(right as set: Bool) do
+                            skip;
+                    end case;
+                    i := i + 1;
+                end while;
+                if not going then
+                    rollback(&~db, open);
+                    return false;
+                end if;
+                case commit(&~db, open) of
+                    when Left(left as error: DbError) do
+                        return false;
+                    when Right(right as done: Unit) do
+                        return true;
+                end case;
+        end case;
+    end;
+
+    -- One step of relevel after the line after: the lines read without a
+    -- transaction, so without the write lock; the changed ones written
+    -- relevel_write_most a transaction.  Right the lines read, the
+    -- lines changed and the last id read.
+    generic [R: Region]
+    function relevelFrom(db: &![Database[Writing], R], after: Int64): Option[RelevelStep] is
+        var cursor: Cursor := start(&~db, lines_after, withInt64(withInt64(noValues(), after), relevel_step));
+        var ids: Buffer[Int64] := allocateEmpty();
+        var codes: Buffer[Nat8] := allocateEmpty();
+        var seen: Int64 := 0;
+        var last: Int64 := after;
+        while advance(&!cursor) do
+            let id: Int64 := columnInt64(&cursor, 0);
+            let wanted: Nat8 := levelCode(lineLevel(columnText(&cursor, 2)));
+            if storedCode(columnText(&cursor, 1)) /= wanted then
+                insertBack(&!ids, id);
+                insertBack(&!codes, wanted);
+            end if;
+            seen := seen + 1;
+            last := id;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyFree(ids);
+                destroyFree(codes);
+                return None();
+            when None do
+                skip;
+        end case;
+        var going: Bool := true;
+        var i: Index := 0;
+        while going and (i < length(&ids)) do
+            if not relevelSome(&~db, &ids, &codes, i) then
+                going := false;
+            end if;
+            i := i + relevel_write_most;
+        end while;
+        let changed: Int64 := wide(length(&ids));
+        destroyFree(ids);
+        destroyFree(codes);
+        if not going then
+            return None();
+        end if;
+        return Some(value => RelevelStep(seen => seen, changed => changed, last => last));
+    end;
+
+    generic [R: Region]
+    function relevelAfter(db: &![Database[Writing], R], after: Int64): RelevelPart is
+        case relevelFrom(&~db, after) of
+            when None do
+                return RelevelPart(seen => 0, changed => 0, last => after, whole => false);
+            when Some(value as step: RelevelStep) do
+                return RelevelPart(seen => step.seen, changed => step.changed, last => step.last, whole => true);
+        end case;
+    end;
+
+    generic [R: Region]
+    function relevelLines(db: &![Database[Writing], R]): RelevelReport is
+        var after: Int64 := 0;
+        var seen: Int64 := 0;
+        var changed: Int64 := 0;
+        var going: Bool := true;
+        var whole: Bool := true;
+        while going do
+            let part: RelevelPart := relevelAfter(&~db, after);
+            seen := seen + part.seen;
+            changed := changed + part.changed;
+            if not part.whole then
+                whole := false;
+                going := false;
+            else
+                if part.seen = 0 then
+                    going := false;
+                else
+                    after := part.last;
+                end if;
+            end if;
+        end while;
+        return RelevelReport(seen => seen, changed => changed, whole => whole);
+    end;
+
+    function plain(status: Nat16): Response is
+        return addHeader(makeResponse(status, "text/plain; charset=utf-8"), "Cache-Control", "no-store");
+    end;
+
+    function storageLine(step: Span[Nat8, Static], code: Int32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "roxie: /ingest could not keep a batch at ");
+        writeString(&!out, step);
+        writeString(&!out, ": SQLite code ");
+        case toInt64(code) of
+            when Some(value as number: Int64) do
+                let digits: String := decimalText(number);
+                writeString(&!out, asSpan(&digits));
+                destroyString(digits);
+            when None do
+                skip;
+        end case;
+        return finalize(out);
+    end;
+
+    function ingestAnswer(outcome: IngestOutcome): String is
+        case outcome of
+            when Kept(count as kept: Int64) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "kept ");
+                let digits: String := decimalText(kept);
+                writeString(&!out, asSpan(&digits));
+                destroyString(digits);
+                writeString(&!out, "\n");
+                let text: String := finalize(out);
+                let answer: String := respond(plain(200), asSpan(&text));
+                destroyString(text);
+                return answer;
+            when Repeated do
+                return respond(plain(200), "repeated\n");
+            when NotAHost do
+                return respond(plain(403), "forbidden\n");
+            when BadBatch(reason as error: WireError) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "line ");
+                let digits: String := decimalText(wide(error.line));
+                writeString(&!out, asSpan(&digits));
+                destroyString(digits);
+                writeString(&!out, ": ");
+                writeString(&!out, problemName(error.problem));
+                writeString(&!out, "\n");
+                let text: String := finalize(out);
+                let answer: String := respond(plain(400), asSpan(&text));
+                destroyString(text);
+                return answer;
+            when IngestStorage(step as step: Span[Nat8, Static], code as code: Int32) do
+                let line: String := storageLine(step, code);
+                printLn(asSpan(&line));
+                destroyString(line);
+                return respond(plain(500), "storage\n");
+        end case;
+    end;
+
+    generic [S: Region]
+    function certificateHost(subject: Span[Nat8, S]): Option[String] is
+        let size: Index := spanLength(subject);
+        var found: Bool := false;
+        var first: Index := 0;
+        var past: Index := 0;
+        var i: Index := 0;
+        while (i + 3) <= size do
+            -- a field starts the DN or follows ", "
+            var field_start: Bool := (i = 0);
+            if i >= 2 then
+                if (subject[i - 2] = ',') and (subject[i - 1] = ' ') then
+                    field_start := true;
+                end if;
+            end if;
+            if (field_start and (subject[i] = 'C')) and ((subject[i + 1] = 'N') and (subject[i + 2] = '=')) then
+                if found then
+                    return None();
+                end if;
+                found := true;
+                first := i + 3;
+                past := first;
+                while (past < size) and (subject[past] /= ',') do
+                    past := past + 1;
+                end while;
+            end if;
+            i := i + 1;
+        end while;
+        if not found then
+            return None();
+        end if;
+        let name: Span[Nat8, S] := substring(subject, first, past);
+        if not validHostname(name) then
+            return None();
+        end if;
+        var j: Index := 0;
+        while j < spanLength(name) do
+            if (name[j] >= 'A') and (name[j] <= 'Z') then
+                return None();
+            end if;
+            j := j + 1;
+        end while;
+        return Some(value => fromSpan(name));
+    end;
+
+    -- Whether two names are the same bytes.
+    generic [A: Region, B: Region]
+    function sameName(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [A: Region]
+    function isPost(verb: Span[Nat8, A]): Bool is
+        if spanLength(verb) /= 4 then
+            return false;
+        end if;
+        return ((verb[0] = 'P') and (verb[1] = 'O')) and ((verb[2] = 'S') and (verb[3] = 'T'));
+    end;
+
+    generic [R: Region, Q: Region]
+    function answerIngest(db: &![Database[Writing], R], request: &[Request, Q], now: Int64): String is
+        var post: Bool := false;
+        case requestMethod(request) of
+            when Some(value as verb: String) do
+                post := isPost(asSpan(&verb));
+                destroyString(verb);
+            when None do
+                skip;
+        end case;
+        if not post then
+            return respond(addHeader(plain(405), "Allow", "POST"), "method not allowed\n");
+        end if;
+        case requestParam(request, "TLS_SUBJECT_DN") of
+            when None do
+                return respond(plain(403), "a client certificate is needed\n");
+            when Some(value as subject: String) do
+                let named: Option[String] := certificateHost(asSpan(&subject));
+                destroyString(subject);
+                case named of
+                    when None do
+                        return respond(plain(403), "the certificate names no host\n");
+                    when Some(value as certified: String) do
+                        let answer: String := answerFor(&~db, request, asSpan(&certified), now);
+                        destroyString(certified);
+                        return answer;
+                end case;
+        end case;
+    end;
+
+    -- The batch of request for the host certified, when the request's
+    -- token is that host's.
+    generic [R: Region, Q: Region, C: Region]
+    function answerFor(db: &![Database[Writing], R], request: &[Request, Q], certified: Span[Nat8, C], now: Int64): String is
+        case bearerToken(request) of
+            when None do
+                return unauthorized();
+            when Some(value as token: String) do
+                let owner: Either[DbError, Option[String]] := tokenOwner(&~db, asSpan(&token));
+                destroyString(token);
+                case owner of
+                    when Left(left as error: DbError) do
+                        return ingestAnswer(IngestStorage(step => "the owner of the token", code => error.code));
+                    when Right(right as found: Option[String]) do
+                        case found of
+                            when None do
+                                return unauthorized();
+                            when Some(value as host: String) do
+                                if not sameName(asSpan(&host), certified) then
+                                    destroyString(host);
+                                    return respond(plain(403), "the token is not of the certificate's host\n");
+                                else
+                                    let answer: String := ingestAnswer(ingest(&~db, asSpan(&host), requestBody(request), now));
+                                    destroyString(host);
+                                    return answer;
+                                end if;
+                        end case;
+                end case;
+        end case;
+    end;
+end module body.

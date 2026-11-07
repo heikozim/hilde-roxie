@@ -1,0 +1,86 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength,
+    nthRef
+);
+import Standard.Path (
+    directoryName
+);
+import Standard.Text (
+    equal
+);
+import Standard.Sandbox (
+    Policy,
+    makePolicy,
+    allowPromises,
+    allowPath
+);
+import Roxie.Config (
+    AgentConfig
+);
+
+module body Roxie.Confine is
+    -- Whether a file before the one at stop lies in directory.
+    generic [F: Region, D: Region]
+    function directoryBefore(files: &[Buffer[String], F], stop: Index, directory: Span[Nat8, D]): Bool is
+        var j: Index := 0;
+        while j < stop do
+            let other: String := directoryName(asSpan(nthRef(files, j)));
+            let same: Bool := equal(asSpan(&other), directory);
+            destroyString(other);
+            if same then
+                return true;
+            end if;
+            j := j + 1;
+        end while;
+        return false;
+    end;
+
+    function agentPromises(): Span[Nat8, Static] is
+        return "stdio rpath wpath cpath flock inet dns";
+    end;
+
+    generic [C: Region]
+    function agentPolicy(config: &[AgentConfig, C]): Policy is
+        var policy: Policy := allowPromises(makePolicy(), agentPromises());
+        policy := allowPath(policy, asSpan(&(config->ca)), "r");
+        policy := allowPath(policy, asSpan(&(config->certificate)), "r");
+        policy := allowPath(policy, asSpan(&(config->key)), "r");
+        -- The directory of each file, not the file: Landlock holds a
+        -- file by its inode, and a log rotated to a new file of the same
+        -- name would be out of reach.  Each directory once, in the order
+        -- of the files.
+        let files: &[Buffer[String], C] := &(config->files);
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let place: String := directoryName(asSpan(nthRef(files, i)));
+            if (length(&place) > 1) and (not directoryBefore(files, i, asSpan(&place))) then
+                policy := allowPath(policy, asSpan(&place), "r");
+            end if;
+            destroyString(place);
+            i := i + 1;
+        end while;
+        -- The root is never granted: a state directly under / gets no
+        -- directory, and the agent cannot open it.
+        let directory: String := directoryName(asSpan(&(config->state)));
+        if length(&directory) > 1 then
+            policy := allowPath(policy, asSpan(&directory), "rwc");
+        end if;
+        destroyString(directory);
+        policy := allowPath(policy, "/etc/resolv.conf", "r");
+        policy := allowPath(policy, "/etc/hosts", "r");
+        return policy;
+    end;
+end module body.

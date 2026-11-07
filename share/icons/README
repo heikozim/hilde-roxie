@@ -1,0 +1,18 @@
+The icons of ROXIE
+
+A red panda's face, drawn as shapes in the colours of share/roxie.css; our
+own work, no photo.  roxie.svg is the drawing; the PNGs and
+favicon.ico are rendered from the same shapes by scripts/make-icons.py,
+which writes all of this directory but this file:
+
+    python3 scripts/make-icons.py
+
+    roxie.svg              the drawing, 512 by 512 (not served)
+    favicon.ico            16, 32 and 48 as PNG entries
+    apple-touch-icon.png   180, a full square
+    roxie-<n>.png          16 32 48 64 128 180 192 256 512, round corners
+    roxie-round-<n>.png    96 128 256 512, a circle with a ring
+
+Hiawatha serves them from /var/www/roxie (deploy/hiawatha-roxie.urltoolkit);
+ROXIE's pages name /favicon.ico and /apple-touch-icon.png; the stylesheet
+puts /icons/roxie-48.png, 20 by 20, before the name in the head.

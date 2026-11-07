@@ -1,0 +1,355 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- roxie query: the window of --since, the exit status, the text
+-- and the JSON of its schema, and every example of docs/syntax.md as it
+-- is written there, against six lines in a database in memory
+-- (scripts/check-syntax.sh holds the two lists equal).
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains,
+    equal
+);
+import Standard.Search (
+    SearchError
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Json (
+    Json,
+    readJson,
+    destroyJson,
+    integerAt,
+    stringAt,
+    isNullAt,
+    countAt,
+    kindAt,
+    JsonKind,
+    JsonError
+);
+import Wolly.LogStore (
+    keepLine
+);
+import Roxie.Ingest (
+    prepareIngest
+);
+import Roxie.Find (
+    mostShown,
+    defaultShown,
+    mostLinesLooked,
+    schemaVersion,
+    withSince,
+    answerQuery,
+    storageAnswer
+);
+
+module body Roxie.Find.Test is
+    -- 2026-10-15T00:00:00Z.
+    constant now: Int64 := 1792022400;
+
+    function testRules(): Unit is
+        assertTrue(mostShown() = 100, "at most 100 lines at once");
+        assertTrue(defaultShown() = 20, "20 without --limit");
+        assertTrue(mostLinesLooked() = 1000000, "a million lines in a window");
+        assertTrue(schemaVersion() = 1, "schema 1");
+        return nil;
+    end;
+
+    generic [S: Region]
+    function sinceIs(since: Span[Nat8, S], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case withSince("host:server", since, now) of
+            when Some(value as made: String) do
+                if not equal(asSpan(&made), wanted) then
+                    printLn(asSpan(&made));
+                end if;
+                assertTrue(equal(asSpan(&made), wanted), message);
+                destroyString(made);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [S: Region]
+    function sinceRefused(since: Span[Nat8, S], message: Span[Nat8, Static]): Unit is
+        case withSince("host:server", since, now) of
+            when Some(value as made: String) do
+                printLn(asSpan(&made));
+                assertTrue(false, message);
+                destroyString(made);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testSince(): Unit is
+        sinceIs("", "host:server", "no --since: the query as it is");
+        sinceIs("24h", "(host:server) and time:last 24h", "a window");
+        sinceIs("90s", "(host:server) and time:last 90s", "seconds");
+        sinceIs("15m", "(host:server) and time:last 15m", "minutes");
+        sinceIs("7d", "(host:server) and time:last 7d", "days");
+        sinceIs("2w", "(host:server) and time:last 2w", "weeks");
+        sinceIs("2026-10-13", "(host:server) and time:[2026-10-13 .. 1792022400]", "from a day on");
+        sinceIs("1791849600", "(host:server) and time:[1791849600 .. 1792022400]", "from a second on");
+        sinceRefused("h", "a unit without a number");
+        sinceRefused("24", "24 is no second of 1970 but a mistake");
+        sinceRefused("12345678", "seconds of 8 digits");
+        sinceIs("123456789", "(host:server) and time:[123456789 .. 1792022400]", "seconds of 9 digits");
+        sinceRefused("24x", "another unit");
+        sinceRefused("1234567890h", "a window of 10 digits");
+        sinceRefused("2026-1-13", "a day not YYYY-MM-DD");
+        sinceRefused("2026-10x13", "a day without its second minus");
+        sinceRefused("1234567890123", "seconds of 13 digits");
+        sinceRefused("24h) or (host:web1", "nothing of a query in --since");
+        sinceRefused("-1", "a sign");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function keep(db: &![Database[Writing], R], host: Span[Nat8, Static], source: Span[Nat8, Static], at: Int64,
+                  level: Span[Nat8, Static], text: Span[Nat8, Static]): Unit is
+        case keepLine(&~db, host, source, at, level, text) of
+            when Right(right as kept: Option[Int64]) do
+                case kept of
+                    when Some(value as id: Int64) do
+                        assertTrue(true, "a line kept");
+                    when None do
+                        assertTrue(false, "a line kept");
+                end case;
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "a line kept");
+        end case;
+        return nil;
+    end;
+
+    -- The six lines of the examples of docs/syntax.md, ids 1 to 6.
+    generic [R: Region]
+    function lines(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        keep(&~db, "server", "/var/log/syslog", now - 60, "error", "mariadb: Table is marked as crashed and should be repaired");
+        keep(&~db, "server", "/var/log/syslog", now - 7200, "info", "systemd[1]: Started cron.service");
+        keep(&~db, "server", "/var/log/hiawatha/access.log", now - 100, "info", "GET /index.html 200");
+        keep(&~db, "web1.example.org", "/var/log/syslog", now - 169200, "warn", "disk nearly full on /var");
+        keep(&~db, "web1.example.org", "/var/log/nginx/error.log", now - 30, "error", "upstream timed out while reading");
+        keep(&~db, "web2.example.org", "/var/log/syslog", now - 600, "debug", "cron: job 42 done");
+        return nil;
+    end;
+
+    -- An example of docs/syntax.md: query finds count lines, the JSON says so.
+    generic [R: Region]
+    function found(db: &![Database[Writing], R], query: Span[Nat8, Static], count: Int64): Unit is
+        let { status as got: Int32, out as out: String, err as err: String } := answerQuery(&~db, query, "", now, 100, true, false, "9.8.7");
+        var status: Int32 := 0;
+        if count = 0 then
+            status := 1;
+        end if;
+        if got /= status then
+            printLn(query);
+            printLn(asSpan(&out));
+            printLn(asSpan(&err));
+        end if;
+        assertTrue(got = status, query);
+        case readJson(asSpan(&out)) of
+            when Right(right as document: Json) do
+                let total: Option[Int64] := integerAt(&document, "/total");
+                case total of
+                    when Some(value as n: Int64) do
+                        if n /= count then
+                            printLn(query);
+                            printLn(asSpan(&out));
+                        end if;
+                        assertTrue(n = count, query);
+                    when None do
+                        assertTrue(false, query);
+                end case;
+                destroyJson(document);
+            when Left(left as error: JsonError) do
+                printLn(asSpan(&out));
+                assertTrue(false, query);
+        end case;
+        destroyString(out);
+        destroyString(err);
+        return nil;
+    end;
+
+    -- An example of docs/syntax.md that is refused at byte position.
+    generic [R: Region]
+    function refused(db: &![Database[Writing], R], query: Span[Nat8, Static], position: Int64): Unit is
+        let { status as got: Int32, out as out: String, err as err: String } := answerQuery(&~db, query, "", now, 100, true, false, "9.8.7");
+        assertTrue(got = 2, query);
+        case readJson(asSpan(&out)) of
+            when Right(right as document: Json) do
+                case integerAt(&document, "/error/position") of
+                    when Some(value as at: Int64) do
+                        if at /= position then
+                            printLn(query);
+                            printLn(asSpan(&out));
+                        end if;
+                        assertTrue(at = position, query);
+                    when None do
+                        assertTrue(false, query);
+                end case;
+                case stringAt(&document, "/error/kind") of
+                    when Some(value as kind: String) do
+                        assertTrue(equal(asSpan(&kind), "refused"), query);
+                        destroyString(kind);
+                    when None do
+                        assertTrue(false, query);
+                end case;
+                destroyJson(document);
+            when Left(left as error: JsonError) do
+                printLn(asSpan(&out));
+                assertTrue(false, query);
+        end case;
+        destroyString(out);
+        destroyString(err);
+        return nil;
+    end;
+
+    -- The examples of docs/syntax.md, in its order.
+    generic [R: Region]
+    function examples(db: &![Database[Writing], R]): Unit is
+        found(&~db, "host:server", 3);
+        found(&~db, "host:SERVER", 3);
+        found(&~db, "host:web*", 3);
+        found(&~db, "host:\"web1.example.org\"", 2);
+        found(&~db, "source:/var/log/hiawatha/*", 1);
+        found(&~db, "source:\"/var/log/syslog\"", 4);
+        found(&~db, "level:error", 2);
+        found(&~db, "level:debug", 1);
+        found(&~db, "id:3", 1);
+        found(&~db, "id:[1 .. 2]", 2);
+        found(&~db, "\"table is marked\"", 1);
+        found(&~db, "\"marked table\"", 0);
+        found(&~db, "\"TIMED OUT\"", 1);
+        found(&~db, "level:error and host:server", 1);
+        found(&~db, "level:error or level:warn", 3);
+        found(&~db, "host:server and not level:info", 1);
+        found(&~db, "not level:info and host:server", 1);
+        found(&~db, "host:web1.example.org or host:server and level:error", 3);
+        found(&~db, "(host:web1.example.org or host:server) and level:error", 2);
+        found(&~db, "time:last 24h", 5);
+        found(&~db, "time:last 1h and host:server", 2);
+        found(&~db, "time:2026-10-13", 1);
+        found(&~db, "time:[2026-10-13 .. 2026-10-14]", 6);
+        found(&~db, "time:[1792022000 .. 1792022400]", 3);
+        found(&~db, "time:[\"2026-10-14T23:55:00Z\" .. \"2026-10-15T00:00:00Z\"]", 3);
+        found(&~db, "host:server and level:error and time:last 24h and \"mariadb\"", 1);
+        found(&~db, "host:nobody.example.org", 0);
+        refused(&~db, "level:ERROR", 6);
+        refused(&~db, "mariadb", 0);
+        refused(&~db, "\"crashed", 0);
+        refused(&~db, "host:server and", 15);
+        refused(&~db, "host:server level:error", 12);
+        refused(&~db, "time:[2026-10-15 .. 2026-10-01]", 5);
+        refused(&~db, "colour:red", 0);
+        return nil;
+    end;
+
+    -- The answer to query with since and limit has status, its out holds
+    -- part and its err holds problem.
+    generic [R: Region, S: Region]
+    function answerIs(db: &![Database[Writing], R], query: Span[Nat8, Static], since: Span[Nat8, S], limit: Int64, json: Bool, verbose: Bool,
+                      status: Int32, part: Span[Nat8, Static], problem: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let { status as got: Int32, out as out: String, err as err: String } := answerQuery(&~db, query, since, now, limit, json, verbose, "9.8.7");
+        let good: Bool := (got = status) and contains(asSpan(&out), part) and contains(asSpan(&err), problem);
+        if not good then
+            printLn(message);
+            printLn(asSpan(&out));
+            printLn(asSpan(&err));
+        end if;
+        assertTrue(good, message);
+        destroyString(out);
+        destroyString(err);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function answers(db: &![Database[Writing], R]): Unit is
+        answerIs(&~db, "host:server", "", 20, false, false, 0, "2026-10-14T23:59:00Z\tatarax\terror\t/var/log/syslog\tmariadb: Table is marked as crashed and should be repaired\n", "", "a line of text: time, host, level, source, text");
+        answerIs(&~db, "host:server", "", 20, false, false, 0, "2026-10-14T23:58:20Z\tatarax\tinfo\t/var/log/hiawatha/access.log\tGET /index.html 200\n2026-10-14T22:00:00Z\tatarax\tinfo", "", "newest first");
+        answerIs(&~db, "host:server", "", 1, false, false, 0, "mariadb", "", "--limit 1");
+        answerIs(&~db, "host:server", "", 1, false, true, 0, "mariadb", "3 lines in all, 1 shown\n", "-v: how many in all and how many shown, to standard error");
+        answerIs(&~db, "host:server", "", 1, true, true, 0, "\"total\":3,\"shown\":1", "", "-v with --json: the JSON says it");
+        answerIs(&~db, "host:nobody.example.org", "", 20, false, false, 1, "", "", "nothing found: 1");
+        answerIs(&~db, "level:ERROR", "", 20, false, false, 2, "", "roxie: a value the field does not take, at byte 6 of: level:ERROR\n", "a refused query to standard error: 2");
+        answerIs(&~db, "host:server", "24x", 20, false, false, 2, "", "--since is N and s, m, h, d or w", "a refused --since: 2");
+        answerIs(&~db, "host:server", "", 20, true, false, 0, "{\"schema\":1,\"version\":\"9.8.7\",\"query\":\"host:server\",\"now\":1792022400,\"total\":3,\"shown\":3,\"lines\":[{\"id\":1,\"at\":1792022340,\"time\":\"2026-10-14T23:59:00Z\",\"host\":\"server\",\"source\":\"/var/log/syslog\",\"level\":\"error\",\"line\":\"mariadb: Table is marked as crashed and should be repaired\"}", "", "the JSON of the schema, field by field in its order");
+        answerIs(&~db, "host:server", "1h", 20, true, false, 0, "\"query\":\"(host:server) and time:last 1h\"", "", "the query as it ran, --since joined");
+        answerIs(&~db, "host:server", "1h", 20, true, false, 0, "\"total\":2,\"shown\":2", "", "--since 1h leaves the line of two hours ago out");
+        answerIs(&~db, "host:server", "", 2, true, false, 0, "\"total\":3,\"shown\":2", "", "--limit 2 shows 2 of 3");
+        answerIs(&~db, "host:nobody.example.org", "", 20, true, false, 1, "\"total\":0,\"shown\":0,\"lines\":[]}\n", "", "nothing found: an empty list and 1");
+        answerIs(&~db, "level:ERROR", "", 20, true, false, 2, "\"error\":{\"kind\":\"refused\",\"problem\":\"a value the field does not take\",\"position\":6}}\n", "at byte 6", "a refusal as JSON and to standard error");
+        answerIs(&~db, "host:server", "24x", 20, true, false, 2, "\"error\":{\"kind\":\"since\",\"problem\":\"--since is N and s, m, h, d or w, a day YYYY-MM-DD or seconds\",\"position\":null}}", "", "a refused --since as JSON");
+        answerIs(&~db, "\"crashed\" and \"repaired\"", "", 20, true, false, 0, "\"line\":\"mariadb: Table is marked as crashed and should be repaired\"", "", "two texts");
+        let { status as s1: Int32, out as o1: String, err as e1: String } := storageAnswer("host:server", true, "9.8.7");
+        assertTrue(s1 = 4, "no store: 4");
+        assertTrue(contains(asSpan(&o1), "\"error\":{\"kind\":\"storage\""), "no store as JSON");
+        destroyString(o1);
+        destroyString(e1);
+        let { status as s2: Int32, out as o2: String, err as e2: String } := storageAnswer("host:server", false, "9.8.7");
+        assertTrue((s2 = 4) and equal(asSpan(&o2), ""), "no store without JSON: nothing to standard output");
+        assertTrue(contains(asSpan(&e2), "roxie: the store could not be read"), "no store: why, to standard error");
+        destroyString(o2);
+        destroyString(e2);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function escaped(db: &![Database[Writing], R]): Unit is
+        keep(&~db, "server", "/var/log/app.log", now - 5, "info", "a \"quote\" and a \\ and\ta tab");
+        let { status as got: Int32, out as out: String, err as err: String } := answerQuery(&~db, "\"quote\"", "", now, 20, true, false, "9.8.7");
+        assertTrue(got = 0, "a line with quotes found");
+        assertTrue(contains(asSpan(&out), "\"line\":\"a \\\"quote\\\" and a \\\\ and\\ta tab\""), "quotes, a backslash and a tab escaped");
+        case readJson(asSpan(&out)) of
+            when Right(right as document: Json) do
+                case stringAt(&document, "/lines/0/line") of
+                    when Some(value as line: String) do
+                        assertTrue(equal(asSpan(&line), "a \"quote\" and a \\ and\ta tab"), "the line read back as it was kept");
+                        destroyString(line);
+                    when None do
+                        assertTrue(false, "the line read back");
+                end case;
+                destroyJson(document);
+            when Left(left as error: JsonError) do
+                assertTrue(false, "the JSON of a line with quotes is JSON");
+        end case;
+        destroyString(out);
+        destroyString(err);
+        return nil;
+    end;
+
+    function testFind(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                lines(&!db);
+                examples(&!db);
+                answers(&!db);
+                escaped(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

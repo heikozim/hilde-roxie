@@ -1,0 +1,593 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    parseInt,
+    indexOf
+);
+import Standard.BuildInfo (
+    value
+);
+import Roxie.Version (
+    numberOf
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    lengthMut,
+    nth,
+    remove,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.Template (
+    Render
+);
+import Standard.Calendar (
+    Instant,
+    formatRfc3339
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    withInt64,
+    start,
+    advance,
+    columnText,
+    columnInt64,
+    finish
+);
+import Wolly.Metrics (
+    Total
+);
+import Wolly.Dashboard (
+    Panel,
+    PanelKind,
+    TilePanel,
+    ChangePanel,
+    LinePanel,
+    BarPanel
+);
+import Wolly.LogStore (
+    lineOf
+);
+import Wolly.Response (
+    decimalText
+);
+import Wolly.Query (
+    QueryProblem,
+    QueryTooLong,
+    NoQuery,
+    TooDeep,
+    TooManyTerms,
+    UnexpectedByte,
+    UnclosedQuote,
+    UnclosedParenthesis,
+    ExpectedTerm,
+    ExpectedOperator,
+    UnquotedWord,
+    UnknownQueryField,
+    BadValue,
+    BadTime,
+    BadRange,
+    TooManyWords,
+    TooManyTexts,
+    QueryError,
+    QueryFailure,
+    QueryRefused,
+    TooManyLines,
+    QueryStorage,
+    QueryResult,
+    findByQuery
+);
+
+module body Roxie.Web is
+    constant size_of_page: Int64 := 50;
+    constant lines_searched_most: Int64 := 1000000;
+
+    record TopView: Linear is
+        query: String;
+        csrf: String;
+    end;
+
+    record LineView: Linear is
+        time: String;
+        host: String;
+        level: String;
+        source: String;
+        text: String;
+    end;
+
+    record SearchView: Linear is
+        query: String;
+        generated: String;
+        top: String;
+        problem: String;
+        position: Int64;
+        before: String;
+        after: String;
+        searched: Bool;
+        total: Int64;
+        shown: Int64;
+        firstShown: Int64;
+        lastShown: Int64;
+        lines: Buffer[LineView];
+        newer: Int64;
+        older: Int64;
+    end;
+
+    --: a source of a host over the last 24 hours, with the counts
+    -- of its host; first opens the section of the host, closes ends it.
+    record HostRow: Linear is
+        first: Bool;
+        closes: Bool;
+        host: String;
+        source: String;
+        lines: Int64;
+        errors: Int64;
+        warns: Int64;
+        last: String;
+        query: String;
+        hostLines: Int64;
+        hostErrors: Int64;
+        hostWarns: Int64;
+        hostQuery: String;
+    end;
+
+    record HostsView: Linear is
+        every: Int64;
+        rows: Buffer[HostRow];
+    end;
+
+    record HelpView: Linear is
+        generated: String;
+        top: String;
+    end;
+
+    -- The sources of the hosts since a time, by host and source, with the
+    -- sums of each host and the queries of their searches.  It reads
+    -- Wolly.LogStore's table by SQL of its own, as relevel does:
+    -- the counts by group are no question Wolly.Query answers.
+    constant hosts_sql: Span[Nat8, Static] := "SELECT host, source, count(*), sum(level = 'error'), sum(level = 'warn'), max(at), sum(count(*)) OVER byHost, sum(sum(level = 'error')) OVER byHost, sum(sum(level = 'warn')) OVER byHost, row_number() OVER (PARTITION BY host ORDER BY source), row_number() OVER (PARTITION BY host ORDER BY source DESC), 'host:\"' || host || '\" and source:\"' || source || '\" and time:last 24h', 'host:\"' || host || '\" and time:last 24h' FROM wolly_log_lines WHERE at >= ? GROUP BY host, source WINDOW byHost AS (PARTITION BY host) ORDER BY host, source LIMIT 500";
+    constant hosts_window: Int64 := 86400;
+
+    function linesPerPage(): Int64 is
+        return size_of_page;
+    end;
+
+    function mostLinesSearched(): Int64 is
+        return lines_searched_most;
+    end;
+
+    function panelOf(name: Span[Nat8, Static], title: Span[Nat8, Static], metric: Span[Nat8, Static], kind: PanelKind,
+                     buckets: Index): Panel is
+        return Panel(name => name, title => title, metric => metric, kind => kind, fold => Total(), step => 3600, buckets => buckets);
+    end;
+
+    function roxiePanels(): Buffer[Panel] is
+        var panels: Buffer[Panel] := allocateEmpty();
+        insertBack(&!panels, panelOf("lines", "Lines an hour", "roxie.lines", BarPanel(), 24));
+        insertBack(&!panels, panelOf("errors", "Errors an hour", "roxie.errors", LinePanel(), 24));
+        insertBack(&!panels, panelOf("batches", "Batches this hour", "roxie.batches", ChangePanel(), 2));
+        insertBack(&!panels, panelOf("refused", "Batches refused this hour", "roxie.refused", ChangePanel(), 2));
+        return panels;
+    end;
+
+    function problemText(problem: QueryProblem): Span[Nat8, Static] is
+        case problem of
+            when QueryTooLong do
+                return "the query is longer than 1024 bytes";
+            when NoQuery do
+                return "the query is empty";
+            when TooDeep do
+                return "parentheses and not nest deeper than 16";
+            when TooManyTerms do
+                return "more than 64 terms and operators";
+            when UnexpectedByte do
+                return "a character that is no part of a query; put text in quotes";
+            when UnclosedQuote do
+                return "a quote that is not closed";
+            when UnclosedParenthesis do
+                return "a parenthesis that is not closed";
+            when ExpectedTerm do
+                return "a term is missing";
+            when ExpectedOperator do
+                return "and, or or a closing parenthesis is missing";
+            when UnquotedWord do
+                return "a word without a field; put text in quotes";
+            when UnknownQueryField do
+                return "no such field: host, source, level, time and id are";
+            when BadValue do
+                return "a value the field does not take";
+            when BadTime do
+                return "no time: seconds, YYYY-MM-DD or last 24h";
+            when BadRange do
+                return "a range that ends before it starts";
+            when TooManyWords do
+                return "text of more than 16 words, or a word of more than 64 bytes";
+            when TooManyTexts do
+                return "more than 8 texts in quotes";
+        end case;
+    end;
+
+    generic [V: Region]
+    function renderTop(view: &[TopView, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/top.jinja", view, out);
+        return finalize(out);
+    end;
+
+    generic [T: Region, C: Region]
+    function dashboardTop(text: Span[Nat8, T], csrf: Span[Nat8, C]): String is
+        let view: TopView := TopView(query => fromSpan(text), csrf => fromSpan(csrf));
+        let made: String := renderTop(&view);
+        let { query as q: String, csrf as c: String } := view;
+        destroyString(q);
+        destroyString(c);
+        return made;
+    end;
+
+    generic [V: Region]
+    function renderHelp(view: &[HelpView, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/help.jinja", view, out);
+        return finalize(out);
+    end;
+
+    generic [C: Region]
+    function helpPage(now: Int64, csrf: Span[Nat8, C]): String is
+        let view: HelpView := HelpView(generated => timeText(now), top => dashboardTop("", csrf));
+        let made: String := renderHelp(&view);
+        let { generated as g: String, top as t: String } := view;
+        destroyString(g);
+        destroyString(t);
+        return made;
+    end;
+
+    function footer(): String is
+        case value("version") of
+            when Some(value as version: Span[Nat8, Static]) do
+                return footerOf(version);
+            when None do
+                return footerOf("");
+        end case;
+    end;
+
+    generic [V: Region]
+    function footerOf(version: Span[Nat8, V]): String is
+        let number: Span[Nat8, V] := numberOf(version);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<footer class=\"site-foot\">ROXIE ");
+        if spanLength(number) > 0 then
+            writeString(&!out, "v");
+            writeString(&!out, number);
+        else
+            writeString(&!out, "dev");
+        end if;
+        writeString(&!out, " - Ranked Objects eXtended Index Engine - (c) 2026 <a href=\"https://www.heiko-zimmermann.com/\" target=\"_blank\" rel=\"noopener noreferrer\">Heiko Zimmermann</a></footer>\n");
+        return finalize(out);
+    end;
+
+    generic [P: Region, F: Region]
+    function withFooter(page: Span[Nat8, P], foot: Span[Nat8, F]): String is
+        case indexOf(page, "</body>") of
+            when Some(value as at: Index) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, substring(page, 0, at));
+                writeString(&!out, foot);
+                writeString(&!out, substring(page, at, spanLength(page)));
+                return finalize(out);
+            when None do
+                return fromSpan(page);
+        end case;
+    end;
+
+    -- seconds as RFC 3339 in UTC, or its digits.
+    function timeText(seconds: Int64): String is
+        case formatRfc3339(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return decimalText(seconds);
+        end case;
+    end;
+
+    -- The place of the count-th tab of text from first on, or the end.
+    generic [T: Region]
+    function tabAfter(text: Span[Nat8, T], first: Index): Index is
+        var i: Index := first;
+        while i < spanLength(text) do
+            if text[i] = 9 then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    -- A part of text from first to before stop, empty when there is none.
+    generic [T: Region]
+    function partOf(text: Span[Nat8, T], first: Index, stop: Index): String is
+        if first >= stop then
+            return fromSpan("");
+        end if;
+        return fromSpan(substring(text, first, stop));
+    end;
+
+    -- One line as Wolly.LogStore.lineOf writes it: time, host, source,
+    -- level and the line, by tabs, ending in a line end.
+    generic [T: Region]
+    function lineViewOf(text: Span[Nat8, T]): LineView is
+        let size: Index := spanLength(text);
+        var stop: Index := size;
+        if stop > 0 then
+            if text[stop - 1] = 10 then
+                stop := stop - 1;
+            end if;
+        end if;
+        let tab1: Index := tabAfter(text, 0);
+        let tab2: Index := tabAfter(text, tab1 + 1);
+        let tab3: Index := tabAfter(text, tab2 + 1);
+        let tab4: Index := tabAfter(text, tab3 + 1);
+        return LineView(time => timeOf(substring(text, 0, tab1)), host => partOf(text, tab1 + 1, tab2), source => partOf(text, tab2 + 1, tab3),
+                        level => partOf(text, tab3 + 1, tab4), text => partOf(text, tab4 + 1, stop));
+    end;
+
+    -- The time of the digits as RFC 3339, empty for digits that are none.
+    generic [D: Region]
+    function timeOf(digits: Span[Nat8, D]): String is
+        case parseInt(digits) of
+            when Some(value as seconds: Int64) do
+                return timeText(seconds);
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function destroyLines(lines: Buffer[LineView]): Unit is
+        var rest: Buffer[LineView] := lines;
+        while lengthMut(&!rest) > 0 do
+            let last: Index := lengthMut(&!rest) - 1;
+            let { time as a: String, host as b: String, level as c: String, source as d: String, text as e: String } := remove(&!rest, last);
+            destroyString(a);
+            destroyString(b);
+            destroyString(c);
+            destroyString(d);
+            destroyString(e);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [V: Region]
+    function renderSearch(view: &[SearchView, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/search.jinja", view, out);
+        return finalize(out);
+    end;
+
+    -- Renders view and frees it.
+    function pageOf(view: SearchView): String is
+        let made: String := renderSearch(&view);
+        let { query as a: String, generated as b: String, top as c: String, problem as d: String, position as p: Int64,
+              before as e: String, after as f: String, searched as s: Bool, total as t: Int64, shown as n: Int64,
+              firstShown as h: Int64, lastShown as l: Int64, lines as g: Buffer[LineView], newer as w: Int64,
+              older as o: Int64 } := view;
+        destroyString(a);
+        destroyString(b);
+        destroyString(c);
+        destroyString(d);
+        destroyString(e);
+        destroyString(f);
+        destroyLines(g);
+        return made;
+    end;
+
+    function wide(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The page of a query that is refused or not run: problem at position
+    -- of text, nothing searched.
+    generic [T: Region]
+    function refusedPage(text: Span[Nat8, T], top: String, problem: Span[Nat8, Static], position: Index, now: Int64): String is
+        var at: Index := position;
+        if at > spanLength(text) then
+            at := spanLength(text);
+        end if;
+        let none: Buffer[LineView] := allocateEmpty();
+        let view: SearchView := SearchView(query => fromSpan(text), generated => timeText(now), top => top,
+                                           problem => fromSpan(problem), position => wide(at),
+                                           before => fromSpan(substring(text, 0, at)),
+                                           after => fromSpan(substring(text, at, spanLength(text))), searched => false,
+                                           total => 0, shown => 0, firstShown => 0, lastShown => 0, lines => none,
+                                           newer => 0 - 1, older => 0 - 1);
+        return pageOf(view);
+    end;
+
+    -- The lines of keys, read back; Left when SQLite refused one.
+    generic [R: Region, K: Region]
+    function linesOf(db: &![Database[Writing], R], keys: &[Buffer[Int64], K]): Either[DbError, Buffer[LineView]] is
+        var lines: Buffer[LineView] := allocateEmpty();
+        var problem: Option[DbError] := None();
+        var i: Index := 0;
+        while (i < length(keys)) and (lengthMut(&!lines) = i) do
+            let key: String := decimalText(nth(keys, i));
+            case lineOf(&~db, asSpan(&key)) of
+                when Left(left as error: DbError) do
+                    problem := Some(value => error);
+                when Right(right as found: Option[String]) do
+                    case found of
+                        when Some(value as line: String) do
+                            insertBack(&!lines, lineViewOf(asSpan(&line)));
+                            destroyString(line);
+                        when None do
+                            insertBack(&!lines, lineViewOf(""));
+                    end case;
+            end case;
+            destroyString(key);
+            i := i + 1;
+        end while;
+        case problem of
+            when Some(value as error: DbError) do
+                destroyLines(lines);
+                return Left(left => error);
+            when None do
+                return Right(right => lines);
+        end case;
+    end;
+
+    generic [R: Region, T: Region, C: Region]
+    function searchPage(db: &![Database[Writing], R], text: Span[Nat8, T], offset: Int64, now: Int64,
+                        csrf: Span[Nat8, C]): Either[DbError, String] is
+        let top: String := dashboardTop(text, csrf);
+        if spanLength(text) = 0 then
+            let none: Buffer[LineView] := allocateEmpty();
+            let view: SearchView := SearchView(query => fromSpan(""), generated => timeText(now), top => top,
+                                               problem => fromSpan(""), position => 0, before => fromSpan(""),
+                                               after => fromSpan(""), searched => false, total => 0, shown => 0,
+                                               firstShown => 0, lastShown => 0, lines => none, newer => 0 - 1,
+                                               older => 0 - 1);
+            return Right(right => pageOf(view));
+        else
+            return searchedPage(&~db, text, offset, now, top);
+        end if;
+    end;
+
+    -- The page of a query that is not empty, top made already.
+    generic [R: Region, T: Region]
+    function searchedPage(db: &![Database[Writing], R], text: Span[Nat8, T], offset: Int64, now: Int64, top: String): Either[DbError, String] is
+        case findByQuery(&~db, text, now, lines_searched_most, size_of_page, offset) of
+            when Left(left as failure: QueryFailure) do
+                case failure of
+                    when QueryRefused(reason as error: QueryError) do
+                        return Right(right => refusedPage(text, top, problemText(error.problem), error.position, now));
+                    when TooManyLines do
+                        return Right(right => refusedPage(text, top, "more lines in the time window than a search looks at; add time:last 24h", 0, now));
+                    when QueryStorage(error as error: DbError) do
+                        destroyString(top);
+                        return Left(left => error);
+                end case;
+            when Right(right as result: QueryResult) do
+                let { total as total: Int64, keys as keys: Buffer[Int64] } := result;
+                let read: Either[DbError, Buffer[LineView]] := linesOf(&~db, &keys);
+                let count: Int64 := wide(length(&keys));
+                destroyFree(keys);
+                case read of
+                    when Left(left as error: DbError) do
+                        destroyString(top);
+                        return Left(left => error);
+                    when Right(right as lines: Buffer[LineView]) do
+                        var newer: Int64 := 0 - 1;
+                        if offset > 0 then
+                            newer := offset - size_of_page;
+                            if newer < 0 then
+                                newer := (0 : Int64);
+                            end if;
+                        end if;
+                        var older: Int64 := 0 - 1;
+                        if (offset + count) < total then
+                            older := offset + count;
+                        end if;
+                        let view: SearchView := SearchView(query => fromSpan(text), generated => timeText(now), top => top,
+                                                           problem => fromSpan(""), position => 0, before => fromSpan(""),
+                                                           after => fromSpan(""), searched => true, total => total,
+                                                           shown => count, firstShown => offset + 1, lastShown => offset + count,
+                                                           lines => lines, newer => newer, older => older);
+                        return Right(right => pageOf(view));
+                end case;
+        end case;
+    end;
+
+    function destroyRows(rows: Buffer[HostRow]): Unit is
+        var rest: Buffer[HostRow] := rows;
+        while lengthMut(&!rest) > 0 do
+            let at: Index := lengthMut(&!rest) - 1;
+            let { first as f: Bool, closes as c: Bool, host as a: String, source as b: String, lines as l: Int64,
+                  errors as e: Int64, warns as w: Int64, last as t: String, query as q: String, hostLines as hl: Int64,
+                  hostErrors as he: Int64, hostWarns as hw: Int64, hostQuery as hq: String } := remove(&!rest, at);
+            destroyString(a);
+            destroyString(b);
+            destroyString(t);
+            destroyString(q);
+            destroyString(hq);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- The row the cursor stands on.
+    generic [C: Region]
+    function hostRowOf(cursor: &[Cursor, C]): HostRow is
+        let first: Bool := columnInt64(cursor, 9) = 1;
+        let closes: Bool := columnInt64(cursor, 10) = 1;
+        let host: String := fromSpan(columnText(cursor, 0));
+        let source: String := fromSpan(columnText(cursor, 1));
+        let lines: Int64 := columnInt64(cursor, 2);
+        let errors: Int64 := columnInt64(cursor, 3);
+        let warns: Int64 := columnInt64(cursor, 4);
+        let last: String := timeText(columnInt64(cursor, 5));
+        let host_lines: Int64 := columnInt64(cursor, 6);
+        let host_errors: Int64 := columnInt64(cursor, 7);
+        let host_warns: Int64 := columnInt64(cursor, 8);
+        let query: String := fromSpan(columnText(cursor, 11));
+        let host_query: String := fromSpan(columnText(cursor, 12));
+        return HostRow(first => first, closes => closes, host => host, source => source, lines => lines, errors => errors,
+                       warns => warns, last => last, query => query, hostLines => host_lines, hostErrors => host_errors,
+                       hostWarns => host_warns, hostQuery => host_query);
+    end;
+
+    generic [V: Region]
+    function renderHosts(view: &[HostsView, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/hosts.jinja", view, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function hostsPanel(db: &![Database[Writing], R], now: Int64, every: Int64): Either[DbError, String] is
+        var rows: Buffer[HostRow] := allocateEmpty();
+        var cursor: Cursor := start(&~db, hosts_sql, withInt64(noValues(), now - hosts_window));
+        while advance(&!cursor) do
+            insertBack(&!rows, hostRowOf(&cursor));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyRows(rows);
+                return Left(left => error);
+            when None do
+                let view: HostsView := HostsView(every => every, rows => rows);
+                let made: String := renderHosts(&view);
+                let { every as e: Int64, rows as r: Buffer[HostRow] } := view;
+                destroyRows(r);
+                return Right(right => made);
+        end case;
+    end;
+
+end module body.

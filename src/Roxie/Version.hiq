@@ -1,0 +1,81 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Text (
+    substring,
+    isDigit
+);
+import Standard.BuildInfo (
+    value
+);
+
+module body Roxie.Version is
+    -- Whether byte may stand in a version: a letter, a digit, a dot, a
+    -- minus or a plus.
+    function versionByte(byte: Nat8): Bool is
+        if isDigit(byte) then
+            return true;
+        end if;
+        if (byte >= 65) and (byte <= 90) then
+            return true;
+        end if;
+        if (byte >= 97) and (byte <= 122) then
+            return true;
+        end if;
+        return (byte = 46) or (byte = 45) or (byte = 43);
+    end;
+
+    -- The place of the first minus of text from first on, or the end.
+    generic [T: Region]
+    function minusAfter(text: Span[Nat8, T], first: Index): Index is
+        var i: Index := first;
+        while i < spanLength(text) do
+            if text[i] = 45 then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    generic [V: Region]
+    function numberOf(version: Span[Nat8, V]): Span[Nat8, V] is
+        var i: Index := 0;
+        while i < spanLength(version) do
+            if not versionByte(version[i]) then
+                return substring(version, 0, 0);
+            end if;
+            i := i + 1;
+        end while;
+        var first: Index := 0;
+        if spanLength(version) > 0 then
+            if version[0] = 118 then
+                first := 1;
+            end if;
+        end if;
+        let stop: Index := minusAfter(version, first);
+        if stop <= first then
+            return substring(version, 0, 0);
+        end if;
+        if not isDigit(version[first]) then
+            return substring(version, 0, 0);
+        end if;
+        return substring(version, first, stop);
+    end;
+
+    function versionNumber(): Span[Nat8, Static] is
+        case value("version") of
+            when Some(value as version: Span[Nat8, Static]) do
+                let number: Span[Nat8, Static] := numberOf(version);
+                if spanLength(number) > 0 then
+                    return number;
+                end if;
+                return "dev";
+            when None do
+                return "dev";
+        end case;
+    end;
+end module body.

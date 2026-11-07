@@ -1,0 +1,362 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The lines are cut into batches in two passes over the text: the first
+-- finds where each batch begins, by counting lines and the bytes Roxie.Wire
+-- would write; the second writes each batch in a function of its own and
+-- puts it in, so no builder is kept across batches.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    commit,
+    rollback
+);
+import Wolly.LogTail (
+    TailFailure,
+    Unreadable,
+    Storage,
+    prepareTail,
+    readNew
+);
+import Wolly.LogStore (
+    isSource
+);
+import Roxie.Wire (
+    mostBatchLines,
+    mostBatchBytes,
+    batchHeader,
+    writeLine,
+    lineSize
+);
+import Standard.Calendar (
+    Zone
+);
+import Roxie.Line (
+    lineTime,
+    lineLevel
+);
+
+module body Roxie.Outbox is
+    constant make_outbox: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS roxie_outbox (number INTEGER PRIMARY KEY AUTOINCREMENT, lines TEXT NOT NULL) STRICT";
+    constant make_refused: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS roxie_refused (number INTEGER PRIMARY KEY, lines TEXT NOT NULL, answer TEXT NOT NULL) STRICT";
+    constant put_batch: Span[Nat8, Static] := "INSERT INTO roxie_outbox (lines) VALUES (?)";
+    constant oldest: Span[Nat8, Static] := "SELECT number, lines FROM roxie_outbox ORDER BY number LIMIT 1";
+    constant drop_batch: Span[Nat8, Static] := "DELETE FROM roxie_outbox WHERE number = ?";
+    constant keep_refused: Span[Nat8, Static] := "INSERT INTO roxie_refused (number, lines, answer) SELECT number, lines, ? FROM roxie_outbox WHERE number = ?";
+    constant count_waiting: Span[Nat8, Static] := "SELECT count(*) FROM roxie_outbox";
+    -- The sequence of AUTOINCREMENT has a row for the outbox once it numbered a batch.
+    constant start_numbers: Span[Nat8, Static] := "INSERT INTO sqlite_sequence (name, seq) SELECT 'roxie_outbox', ? WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'roxie_outbox')";
+    -- Room for the header of a batch: roxie 1, 18 digits, the line end.
+    constant header_room: Index := 32;
+    -- The longest level Roxie.Level gives: error, debug.
+    constant level_room: Index := 5;
+
+    generic [R: Region]
+    function prepareOutbox(db: &![Database[Writing], R]): Bool is
+        case prepareTail(&~db) of
+            when Some(value as error: DbError) do
+                return false;
+            when None do
+                skip;
+        end case;
+        case execute(&~db, make_outbox, noValues()) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, make_refused, noValues()) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as made: Nat64) do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function startNumbersAt(db: &![Database[Writing], R], start: Int64): Bool is
+        case execute(&~db, start_numbers, withInt64(noValues(), start)) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as made: Nat64) do
+                return true;
+        end case;
+    end;
+
+    -- The end of the line that begins at first: its line end, or the end
+    -- of the text.
+    generic [T: Region]
+    function lineEndFrom(text: Span[Nat8, T], first: Index): Index is
+        var i: Index := first;
+        while i < spanLength(text) do
+            if text[i] = 10 then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    -- Where each batch but the first begins.
+    generic [T: Region, P: Region]
+    function cutsOf(text: Span[Nat8, T], path: Span[Nat8, P]): Buffer[Index] is
+        var cuts: Buffer[Index] := allocateEmpty();
+        let size: Index := spanLength(text);
+        var lines: Index := 0;
+        var bytes: Index := header_room;
+        var at: Index := 0;
+        while at < size do
+            let stop: Index := lineEndFrom(text, at);
+            let need: Index := lineSize(level_room, spanLength(path), stop - at);
+            if (lines > 0) and (((lines + 1) > mostBatchLines()) or ((bytes + need) > mostBatchBytes())) then
+                insertBack(&!cuts, at);
+                lines := (0 : Index);
+                bytes := header_room;
+            end if;
+            lines := lines + 1;
+            bytes := bytes + need;
+            at := stop + 1;
+        end while;
+        return cuts;
+    end;
+
+    -- The lines of the batch from first to before stop, at now.
+    generic [T: Region, P: Region, Z: Region]
+    function batchText(text: Span[Nat8, T], first: Index, stop: Index, path: Span[Nat8, P], zone: &[Zone, Z], now: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        var at: Index := first;
+        while at < stop do
+            let line_end: Index := lineEndFrom(text, at);
+            var text_end: Index := line_end;
+            if text_end > at then
+                if text[text_end - 1] = 13 then
+                    text_end := text_end - 1;
+                end if;
+            end if;
+            let line: Span[Nat8, T] := substring(text, at, text_end);
+            let written: Bool := writeLine(&!out, lineTime(line, zone, now), lineLevel(line), path, line);
+            at := line_end + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Puts the batches of text into the outbox; Right how many lines.
+    generic [R: Region, T: Region, P: Region, Z: Region]
+    function putBatches(db: &![Database[Writing], R], text: Span[Nat8, T], path: Span[Nat8, P], zone: &[Zone, Z], now: Int64): Either[DbError, Int64] is
+        let size: Index := spanLength(text);
+        if size = 0 then
+            let nothing: Int64 := 0;
+            return Right(right => nothing);
+        end if;
+        let cuts: Buffer[Index] := cutsOf(text, path);
+        var problem: Option[DbError] := None();
+        var k: Index := 0;
+        var first: Index := 0;
+        while (k <= length(&cuts)) and (first < size) do
+            var stop: Index := size;
+            if k < length(&cuts) then
+                stop := nth(&cuts, k);
+            end if;
+            case problem of
+                when Some(value as error: DbError) do
+                    problem := Some(value => error);
+                when None do
+                    let data: String := batchText(text, first, stop, path, zone, now);
+                    case execute(&~db, put_batch, withText(noValues(), asSpan(&data))) of
+                        when Left(left as error: DbError) do
+                            problem := Some(value => error);
+                        when Right(right as put: Nat64) do
+                            skip;
+                    end case;
+                    destroyString(data);
+            end case;
+            first := stop;
+            k := k + 1;
+        end while;
+        destroyFree(cuts);
+        case problem of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => countLines(text));
+        end case;
+    end;
+
+    generic [T: Region]
+    function countLines(text: Span[Nat8, T]): Int64 is
+        var count: Int64 := 0;
+        var at: Index := 0;
+        while at < spanLength(text) do
+            at := lineEndFrom(text, at) + 1;
+            count := count + 1;
+        end while;
+        return count;
+    end;
+
+    function collectFailed(failure: CollectFailure): Either[CollectFailure, Int64] is
+        return Left(left => failure);
+    end;
+
+    generic [R: Region, P: Region, Z: Region]
+    function collectFile(db: &![Database[Writing], R], path: Span[Nat8, P], zone: &[Zone, Z], now: Int64): Either[CollectFailure, Int64] is
+        if not isSource(path) then
+            return collectFailed(NotASource());
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return collectFailed(CollectStorage());
+            when Right(right as transaction: Transaction) do
+                case readNew(&~db, path) of
+                    when Left(left as failure: TailFailure) do
+                        rollback(&~db, transaction);
+                        case failure of
+                            when Unreadable do
+                                return collectFailed(NotReadable());
+                            when Storage(error as error: DbError) do
+                                return collectFailed(CollectStorage());
+                        end case;
+                    when Right(right as text: String) do
+                        let put: Either[DbError, Int64] := putBatches(&~db, asSpan(&text), path, zone, now);
+                        destroyString(text);
+                        case put of
+                            when Left(left as error: DbError) do
+                                rollback(&~db, transaction);
+                                return collectFailed(CollectStorage());
+                            when Right(right as count: Int64) do
+                                case commit(&~db, transaction) of
+                                    when Left(left as error: DbError) do
+                                        return collectFailed(CollectStorage());
+                                    when Right(right as done: Unit) do
+                                        return Right(right => count);
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function nextBatch(db: &![Database[Writing], R]): Either[DbError, Option[Pending]] is
+        var cursor: Cursor := start(&~db, oldest, noValues());
+        if advance(&!cursor) then
+            let number: Int64 := columnInt64(&cursor, 0);
+            var out: StringBuilder := makeStringBuilder();
+            let header: String := batchHeader(number);
+            writeString(&!out, asSpan(&header));
+            destroyString(header);
+            writeString(&!out, columnText(&cursor, 1));
+            let data: String := finalize(out);
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(data);
+                    return Left(left => error);
+                when None do
+                    let found: Option[Pending] := Some(value => Pending(number => number, data => data));
+                    return Right(right => found);
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    let none: Option[Pending] := None();
+                    return Right(right => none);
+            end case;
+        end if;
+    end;
+
+    function destroyPending(pending: Pending): Unit is
+        let { number as n: Int64, data as d: String } := pending;
+        destroyString(d);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function batchTaken(db: &![Database[Writing], R], number: Int64): Either[DbError, Bool] is
+        case execute(&~db, drop_batch, withInt64(noValues(), number)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                return Right(right => changed > 0);
+        end case;
+    end;
+
+    generic [R: Region, A: Region]
+    function setAside(db: &![Database[Writing], R], number: Int64, answer: Span[Nat8, A]): Either[DbError, Bool] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case execute(&~db, keep_refused, withInt64(withText(noValues(), answer), number)) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as copied: Nat64) do
+                        case execute(&~db, drop_batch, withInt64(noValues(), number)) of
+                            when Left(left as error: DbError) do
+                                rollback(&~db, transaction);
+                                return Left(left => error);
+                            when Right(right as dropped: Nat64) do
+                                case commit(&~db, transaction) of
+                                    when Left(left as error: DbError) do
+                                        return Left(left => error);
+                                    when Right(right as done: Unit) do
+                                        return Right(right => (copied > 0) and (dropped > 0));
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function waiting(db: &![Database[Writing], R]): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, count_waiting, noValues());
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+end module body.

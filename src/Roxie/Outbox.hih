@@ -1,0 +1,139 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The agent's outbox: the new lines of a log file, read with
+Wolly.LogTail, as batches of Roxie.Wire in the agent's SQLite database,
+until the collector has taken them.
+
+Reading a file and putting its lines into the outbox is one transaction:
+the offset of the file moves only with the batches that hold its lines,
+so a line read is in the outbox, through a crash too.  A batch's number
+is the number of its row, which SQLite gives out growing and never twice
+(AUTOINCREMENT): the collector tells a batch sent again by it.
+
+The time and the level of each line are read from it by Roxie.Line
+: the time it says, never after the time of reading, else the
+time of reading; a line of the BSD form in the zone it is given; the status of an access line of Hiawatha, else the level
+Roxie.Level guesses.  Its source is the path of the file.  A carriage
+return before the line end is dropped.
+
+A batch the collector refused is set aside in a table of its own, with
+the collector's answer, so it does not hold up the batches behind it and
+an operator can look at it.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.Calendar (
+    Zone
+);
+
+module Roxie.Outbox is
+    """
+    Why the lines of a file could not be collected; nothing changed.
+    """
+    union CollectFailure: Free is
+        """
+        The path is no source of Wolly.LogStore (1 to 255 bytes, no control
+        byte).
+        """
+        case NotASource;
+        """
+        The file is not there or cannot be read.
+        """
+        case NotReadable;
+        """
+        SQLite refused a statement.
+        """
+        case CollectStorage;
+    end;
+
+    """
+    A batch waiting: its number and the batch, its header included.
+    """
+    record Pending: Linear is
+        number: Int64;
+        data: String;
+    end;
+
+    """
+    Makes the tables of the outbox and of Wolly.LogTail.  false when SQLite
+    refused one.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareOutbox(db: &![Database[Writing], R]): Bool;
+
+    """
+    Makes the numbers of an outbox that never numbered a batch begin above
+    start: its first batch gets start + 1.  An outbox that numbered a batch
+    keeps its numbers.  The collector answers a batch whose number it has
+    passed as sent already and keeps nothing of it (Roxie.Ingest), so an
+    agent whose state is lost and made again must number above its old
+    state; the agent gives the time in milliseconds.  false when SQLite
+    refused.
+    """
+    generic [R: Region]
+    function startNumbersAt(db: &![Database[Writing], R], start: Int64): Bool
+        requires start >= 0;
+
+    """
+    Puts the new whole lines of the file at path into the outbox, as many
+    batches as they need; Right how many lines.  zone is the zone of the
+    host that wrote the file.
+    """
+    generic [R: Region, P: Region, Z: Region]
+    function collectFile(db: &![Database[Writing], R], path: Span[Nat8, P], zone: &[Zone, Z], now: Int64): Either[CollectFailure, Int64]
+        requires now >= 0;
+
+    """
+    The oldest batch of the outbox, or None when it is empty.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function nextBatch(db: &![Database[Writing], R]): Either[DbError, Option[Pending]];
+
+    """
+    Frees a pending batch.
+
+    No contract: it only frees.
+    """
+    function destroyPending(pending: Pending): Unit;
+
+    """
+    Takes the batch number out of the outbox: the collector has it.  Right
+    true when it was there.
+    (An I/O result: no ensures.)
+    """
+    generic [R: Region]
+    function batchTaken(db: &![Database[Writing], R], number: Int64): Either[DbError, Bool]
+        requires number >= 1;
+
+    """
+    Moves the batch number out of the outbox into the table of refused
+    batches, with the collector's answer.  Right true when it was there.
+    (An I/O result: no ensures.)
+    """
+    generic [R: Region, A: Region]
+    function setAside(db: &![Database[Writing], R], number: Int64, answer: Span[Nat8, A]): Either[DbError, Bool]
+        requires number >= 1;
+
+    """
+    How many batches wait.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function waiting(db: &![Database[Writing], R]): Either[DbError, Int64];
+end module.

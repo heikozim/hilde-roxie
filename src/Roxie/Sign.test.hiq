@@ -1,0 +1,147 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The settings of rambo.conf read, refused when one is missing, twice or
+-- unknown; the address after the logout; a sub bound, found, bound anew
+-- and unbound, in a database in memory.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Wolly.Rambo (
+    RamboConfig,
+    destroyRamboConfig
+);
+import Roxie.Sign (
+    subMost,
+    isSub,
+    readSignConfig,
+    signedOutUri,
+    prepareSign,
+    bindSub,
+    userOfSub,
+    unbindUser
+);
+
+module body Roxie.Sign.Test is
+    constant good: Span[Nat8, Static] := "# ROXIE at RAMBO\nissuer https://auth.example.org\nclient roxie\nredirect https://roxie.example.org/oauth/callback\nca /etc/ssl/certs/ca-certificates.crt\n";
+
+    function reads(text: Span[Nat8, Static], wanted: Bool, message: Span[Nat8, Static]): Unit is
+        case readSignConfig(text, "s3cret") of
+            when Some(value as config: RamboConfig) do
+                destroyRamboConfig(config);
+                assertTrue(wanted, message);
+            when None do
+                assertFalse(wanted, message);
+        end case;
+        return nil;
+    end;
+
+    function testSettings(): Unit is
+        assertTrue(subMost() = 255, "255 bytes a sub");
+        assertTrue(isSub("01JABCDEFGHJKMNPQRSTVWXYZ0"), "a sub of RAMBO");
+        assertFalse(isSub(""), "no sub");
+        assertFalse(isSub("a b"), "a space");
+        reads(good, true, "the settings of server");
+        reads("issuer https://auth.example.org\nclient roxie\nredirect https://roxie.example.org/oauth/callback\n", false, "no ca");
+        reads("issuer https://auth.example.org\nclient roxie\nclient other\nredirect https://roxie.example.org/oauth/callback\nca /c\n", false, "a client twice");
+        reads("issuer https://auth.example.org\nclient roxie\nredirect https://roxie.example.org/oauth/callback\nca /c\nsecret x\n", false, "a setting nobody knows");
+        reads("issuer http://auth.example.org\nclient roxie\nredirect https://roxie.example.org/oauth/callback\nca /c\n", false, "an issuer without https, refused by Wolly.Rambo");
+        reads("issuer https://auth.example.org\nclient roxie\nredirect\nca /c\n", false, "a setting without a value");
+        case signedOutUri(good) of
+            when Some(value as uri: String) do
+                assertTrue(equal(asSpan(&uri), "https://roxie.example.org/signed-out"), "the address after the logout");
+                destroyString(uri);
+            when None do
+                assertTrue(false, "the address after the logout");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function userIs(db: &![Database[Writing], R], sub: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case userOfSub(&~db, sub) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as name: String) do
+                        assertTrue(equal(asSpan(&name), wanted), message);
+                        destroyString(name);
+                    when None do
+                        assertTrue(spanLength(wanted) = 0, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function bound(db: &![Database[Writing], R], sub: Span[Nat8, Static], name: Span[Nat8, Static], wanted: Bool, message: Span[Nat8, Static]): Unit is
+        case bindSub(&~db, sub, name) of
+            when Right(right as done: Bool) do
+                assertTrue(done = wanted, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareSign(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table");
+            when None do
+                skip;
+        end case;
+        userIs(&~db, "01JABC", "", "nobody bound");
+        bound(&~db, "01JABC", "heiko", true, "Heiko's account bound");
+        userIs(&~db, "01JABC", "heiko", "found");
+        userIs(&~db, "01jabc", "", "another case is another sub");
+        bound(&~db, "a b", "heiko", false, "no sub");
+        bound(&~db, "01JXYZ", "Heiko", false, "no user name");
+        bound(&~db, "01JABC", "ann", true, "bound anew");
+        userIs(&~db, "01JABC", "ann", "to the new user");
+        bound(&~db, "01JDEF", "ann", true, "a second account of ann");
+        case unbindUser(&~db, "ann") of
+            when Right(right as removed: Nat64) do
+                assertTrue(removed = 2, "both bindings of ann taken out");
+            when Left(left as error: DbError) do
+                assertTrue(false, "unbind");
+        end case;
+        userIs(&~db, "01JABC", "", "the account opens nothing now");
+        return nil;
+    end;
+
+    function testBindings(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

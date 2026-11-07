@@ -1,0 +1,133 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The configuration of an agent: one setting a line, a name, spaces and its
+value; empty lines and lines that begin with # are skipped.
+
+    collector https://logs.example.org/ingest
+    ca /etc/roxie/ca.pem
+    certificate /etc/roxie/agent.pem
+    key /etc/roxie/agent.key
+    token /etc/roxie/token
+    state /var/db/roxie/agent.db
+    every 10
+    report 600
+    file /var/log/messages
+    file /var/log/nginx/error.log
+
+collector is the https URL of the collector's /ingest; ca the file of the
+certificates the collector's is checked against; certificate and key the
+files of the agent's own certificate and its key, shown to the collector
+(mutual TLS); token the file of the
+host's token (mode 0600, as Wolly.Secret reads it); state the agent's
+SQLite database; every the seconds between two rounds, 1 to 3600; report
+the seconds between two lines of rounds that went well, 0 to 86400, 0 for
+a line every round, 600 when it is left out (Roxie.Agent.dueAt); file
+a log file to read, 1 to 64 of them, each a source of Wolly.LogStore.
+Each setting but file once.  The configuration is the operator's file;
+it is read whole or refused with the number of its line.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Roxie.Config is
+    """
+    The most files an agent reads: 64.
+    """
+    function mostFiles(): Index
+        ensures result = 64;
+
+    """
+    The seconds between two lines of rounds when report is left out: 600.
+    """
+    function defaultReport(): Int64
+        ensures result = 600;
+
+    """
+    The most seconds report takes: 86400, a day.
+    """
+    function mostReport(): Int64
+        ensures result = 86400;
+
+    """
+    What is wrong with a configuration.
+    """
+    union ConfigProblem: Free is
+        """
+        A line that is no name and value.
+        """
+        case NotASetting;
+        """
+        A name that is none of the settings.
+        """
+        case UnknownSetting;
+        """
+        A setting given twice.
+        """
+        case GivenTwice;
+        """
+        A value the setting does not take.
+        """
+        case BadSetting;
+        """
+        A setting that is missing, or no file; the line is 0.
+        """
+        case MissingSetting;
+        """
+        More than mostFiles files.
+        """
+        case TooManyFiles;
+    end;
+
+    """
+    A refused configuration: the problem and the number of its line, from 1.
+    """
+    record ConfigError: Free is
+        line: Index;
+        problem: ConfigProblem;
+    end;
+
+    """
+    An agent's configuration.
+    """
+    record AgentConfig: Linear is
+        collector: String;
+        ca: String;
+        certificate: String;
+        key: String;
+        token: String;
+        state: String;
+        every: Int64;
+        report: Int64;
+        files: Buffer[String];
+    end;
+
+    """
+    The configuration in text.
+
+    No contract: a parser of a file answering an Either.
+    """
+    generic [T: Region]
+    function readConfig(text: Span[Nat8, T]): Either[ConfigError, AgentConfig];
+
+    """
+    Frees a configuration.
+
+    No contract: it only frees.
+    """
+    function destroyConfig(config: AgentConfig): Unit;
+
+    """
+    The name of a problem as the union names it.
+    """
+    function configProblemName(problem: ConfigProblem): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

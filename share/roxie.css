@@ -1,0 +1,436 @@
+/* Part of ROXIE, a log collector on Wolly.
+ * SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ * The stylesheet of ROXIE's pages.
+ * Served by Hiawatha as /style.css (deploy/hiawatha-roxie.urltoolkit),
+ * since the pages allow style-src 'self' only. It is the whole sheet
+ * of the dashboard too: Wolly's dashboard style is not sent, its few layout
+ * rules (the grid of panels) stand below in these colours.
+ *
+ * No framework, no build step, no font from a third party.
+ */
+
+/*
+ * THE COLOURS, IN ONE PLACE: a dark olive scheme, the same variables
+ * with the same values. Every colour of this sheet is one of them.
+ *
+ * CONTRAST, WCAG 2.x relative luminance, measured for every pair this
+ * sheet uses (AA: 4.5 for text, 3 for the edge of a control); the first six are
+ * audit.css's own numbers, measured again as the control of the formula:
+ *   --fg on --bg 11.85, on --surface 8.44        --muted on --bg 7.36, on --surface 5.24
+ *   --blocker on --bg 6.79, on --surface 4.84    --high on --bg 7.32, on --surface 5.21
+ *   --on-accent on --accent 12.94                --link and --accent on --bg 11.21, on --surface 7.98
+ *   --fg on --field 13.36                        --on-secondary on --secondary 12.54
+ *   --on-danger on --danger-fill 6.54
+ *   edges: --edge on --field 5.21, on --bg 4.62, on --surface 3.29; --danger on --bg 5.15,
+ *   on --surface 3.67 (an edge only, never text)
+ * The levels of a line: error --blocker, warn --high, info --fg, debug --muted.
+ */
+:root {
+	color-scheme: dark;
+	--bg: #24300f;
+	--surface: #3b4724;
+	--fg: #edede3;
+	--muted: #b9bfa8;
+	--accent: #e3ee8a;
+	--on-accent: #1b2409;
+	--secondary: #f5f3e8;
+	--on-secondary: #24300f;
+	--link: #e3ee8a;
+	--field: #1c2610;
+	--rule: #55643a;
+	--edge: #8a9b63;
+	--danger: #e8806f;
+	--danger-fill: #b3261e;
+	--on-danger: #ffffff;
+	--blocker: #f2a092;
+	--high: #e8b26a;
+	--gutter: 1.5rem;
+}
+
+body {
+	margin: 0;
+	padding: 0 var(--gutter) 3rem;
+	background: var(--bg);
+	color: var(--fg);
+	font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+a {
+	color: var(--link);
+}
+
+a:hover {
+	text-decoration-thickness: 2px;
+}
+
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+/*
+ * The header bar, as audit's: the lighter surface across the whole width, the
+ * gutter taken back with a negative margin. The pages of ROXIE and Wolly's
+ * dashboard both carry header.wolly-head with the name in an h1.
+ */
+header {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0 1rem;
+	background: var(--surface);
+	border-bottom: 1px solid var(--rule);
+	padding: 1rem var(--gutter);
+	margin: 0 calc(-1 * var(--gutter)) 2rem;
+}
+
+header h1 {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.45rem;
+	margin: 0;
+	font-size: 1rem;
+	font-weight: 600;
+	letter-spacing: 0.18em;
+}
+
+/*
+ * The logo before the name, as audit's brand: 20 px, rounded corners, a small
+ * gap. Drawn by the sheet and not by the markup, so that Wolly's dashboard,
+ * whose header is Wolly's template, has it too.
+ */
+header h1::before {
+	content: "";
+	display: block;
+	width: 20px;
+	height: 20px;
+	border-radius: 22%;
+	background: url("/icons/roxie-48.png") center / cover;
+}
+
+header h1 a {
+	color: inherit;
+	text-decoration: none;
+}
+
+header p {
+	margin: 0;
+	color: var(--muted);
+}
+
+h2 {
+	font-size: 1.1rem;
+	margin: 2rem 0 0.5rem;
+}
+
+/* The head of the dashboard and the search: the search field, the second factor, the way out. */
+.roxie-top {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem 1rem;
+	align-items: center;
+	margin: 0 0 1.5rem;
+}
+
+.roxie-search {
+	flex: 1 1 24rem;
+	min-width: 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+	align-items: center;
+}
+
+.roxie-search label {
+	color: var(--muted);
+}
+
+.roxie-search input {
+	box-sizing: border-box;
+	flex: 1 1 16rem;
+	min-width: 0;
+	max-width: 100%;
+}
+
+.roxie-logout {
+	margin-left: auto;
+}
+
+/* Fields, as audit's .login and .entry inputs. */
+input[type="search"],
+input[type="text"],
+input[type="password"] {
+	font: inherit;
+	color: inherit;
+	background: var(--field);
+	border: 1px solid var(--edge);
+	border-radius: 3px;
+	padding: 0.45rem 0.55rem;
+}
+
+/*
+ * ONE BUTTON, as audit's: the accent for the one primary action of a form
+ * (search, sign in, the code), the cream for what only navigates or leaves
+ * (the way out).
+ */
+button,
+.button {
+	box-sizing: border-box;
+	display: inline-block;
+	margin: 0;
+	font: inherit;
+	font-size: 0.9375rem;
+	line-height: 1.25;
+	text-align: center;
+	text-decoration: none;
+	padding: 6px 14px;
+	border: 1px solid var(--accent);
+	border-radius: 3px;
+	background: var(--accent);
+	color: var(--on-accent);
+	cursor: pointer;
+}
+
+.roxie-logout button {
+	background: var(--secondary);
+	border-color: var(--secondary);
+	color: var(--on-secondary);
+}
+
+button:hover,
+.button:hover {
+	filter: brightness(0.93);
+}
+
+/* The sign-in form and the code of the second factor, as audit's .login. */
+.roxie-login {
+	display: flex;
+	flex-direction: column;
+	gap: 0.35rem;
+	max-width: 22rem;
+	margin-top: 1rem;
+}
+
+.roxie-login input {
+	margin-bottom: 0.6rem;
+}
+
+.roxie-login button {
+	align-self: flex-start;
+}
+
+.roxie-secret {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	overflow-wrap: anywhere;
+}
+
+/* A refused query or login, as audit's .warning: a border, not colour alone. */
+.roxie-problem {
+	color: var(--blocker);
+	border-left: 3px solid var(--danger);
+	padding-left: 0.9rem;
+	margin: 0 0 1.25rem;
+}
+
+.roxie-count,
+.roxie-pages,
+.roxie-none {
+	color: var(--muted);
+}
+
+.roxie-pages {
+	display: flex;
+	gap: 1.25rem;
+	margin-top: 1rem;
+}
+
+/* The lines found and the sources of a host, as audit's table.list. */
+.roxie-lines {
+	border-collapse: collapse;
+	width: 100%;
+	font-size: 0.9rem;
+}
+
+.roxie-lines th,
+.roxie-lines td {
+	text-align: left;
+	padding: 0.4rem 0.7rem 0.4rem 0;
+	border-bottom: 1px solid var(--rule);
+	vertical-align: top;
+	/* a path or a time may break, so that a phone needs no sideways scroll */
+	overflow-wrap: anywhere;
+}
+
+/*
+ * Time, host, level and source keep their width on a wide screen and the line
+ * takes the rest: broken anywhere, the short columns were squeezed to a few
+ * letters each ("atara / x", "erro / r") while the line kept the width
+ *. On a narrow screen they break again, so that a phone needs no
+ * sideways scroll.
+ */
+@media (min-width: 48rem) {
+	.roxie-lines th:nth-child(-n+4),
+	.roxie-lines td:nth-child(-n+4) {
+		white-space: nowrap;
+		overflow-wrap: normal;
+	}
+
+	.roxie-lines td:last-child {
+		width: 100%;
+	}
+}
+
+.roxie-lines th {
+	font-weight: 600;
+	color: var(--muted);
+}
+
+.roxie-lines code,
+.roxie-lines time {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 0.85rem;
+}
+
+.roxie-lines code {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+/*
+ * The level of a line. The colour adds to the word in the Level column, it does
+ * not replace it, as audit's severities.
+ */
+.roxie-error td,
+a.roxie-error {
+	color: var(--blocker);
+}
+
+.roxie-warn td,
+a.roxie-warn {
+	color: var(--high);
+}
+
+.roxie-debug td {
+	color: var(--muted);
+}
+
+/* The page of help: text at a width that reads, its tables as the lines found. */
+.roxie-help-link {
+	white-space: nowrap;
+}
+
+.roxie-help {
+	max-width: 60rem;
+}
+
+.roxie-help p,
+.roxie-help li {
+	max-width: 48rem;
+}
+
+.roxie-help code,
+.roxie-help pre {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 0.9rem;
+}
+
+.roxie-help pre {
+	background: var(--field);
+	border: 1px solid var(--rule);
+	padding: 0.6rem 0.8rem;
+	overflow-x: auto;
+}
+
+.roxie-syntax {
+	border-collapse: collapse;
+	width: 100%;
+	font-size: 0.9rem;
+}
+
+.roxie-syntax th,
+.roxie-syntax td {
+	text-align: left;
+	padding: 0.4rem 0.7rem 0.4rem 0;
+	border-bottom: 1px solid var(--rule);
+	vertical-align: top;
+	overflow-wrap: anywhere;
+}
+
+/* On a wide screen a term keeps its width: broken anywhere, "source:PATH"
+   was cut in the middle; on a phone it breaks, so no sideways scroll. */
+@media (min-width: 48rem) {
+	.roxie-syntax th,
+	.roxie-syntax td {
+		overflow-wrap: break-word;
+	}
+}
+
+.roxie-syntax th {
+	font-weight: 600;
+	color: var(--muted);
+}
+
+/* Wolly's panels in these colours: the grid, the box, the chart in the text colour. */
+.wolly-panels,
+.roxie-hosts {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+	gap: 1rem;
+	margin-top: 1rem;
+}
+
+.roxie-hosts {
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 32rem), 1fr));
+}
+
+.wolly-panel {
+	/* A table wider than a phone scrolls inside its panel, as audit's .scroll. */
+	overflow-x: auto;
+	background: var(--surface);
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	padding: 0.75rem;
+	min-width: 0;
+}
+
+.wolly-panel h2 {
+	font-size: 1rem;
+	margin: 0 0 0.5rem;
+}
+
+.wolly-panel svg {
+	width: 100%;
+	height: auto;
+	display: block;
+	color: var(--fg);
+}
+
+.wolly-note {
+	color: var(--muted);
+	margin: 0;
+}
+
+.wolly-up {
+	color: var(--accent);
+}
+
+.wolly-down {
+	color: var(--blocker);
+}
+
+/* The foot of every page: there, not read -- small and muted,
+ * in the middle of the page. */
+.site-foot {
+	margin-top: 2.5rem;
+	padding: 0.75rem 0 1.5rem;
+	border-top: 1px solid var(--rule);
+	color: var(--muted);
+	font-size: 0.75rem;
+	text-align: center;
+}
+
+.site-foot a {
+	color: inherit;
+}

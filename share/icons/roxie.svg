@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<title>ROXIE</title>
+<rect x="0" y="0" width="512" height="512" rx="96" fill="#24300f"/>
+<polygon points="70,236 104,54 236,150" fill="#f5f3e8"/>
+<polygon points="442,236 408,54 276,150" fill="#f5f3e8"/>
+<polygon points="108,206 124,104 204,160" fill="#1b2409"/>
+<polygon points="404,206 388,104 308,160" fill="#1b2409"/>
+<ellipse cx="256" cy="292" rx="186" ry="160" fill="#e8b26a"/>
+<ellipse cx="186" cy="336" rx="74" ry="60" fill="#f5f3e8"/>
+<ellipse cx="326" cy="336" rx="74" ry="60" fill="#f5f3e8"/>
+<ellipse cx="256" cy="366" rx="68" ry="58" fill="#f5f3e8"/>
+<ellipse cx="186" cy="216" rx="30" ry="20" fill="#f5f3e8" transform="rotate(-12 186 216)"/>
+<ellipse cx="326" cy="216" rx="30" ry="20" fill="#f5f3e8" transform="rotate(12 326 216)"/>
+<ellipse cx="202" cy="318" rx="15" ry="40" fill="#e8b26a" transform="rotate(18 202 318)"/>
+<ellipse cx="310" cy="318" rx="15" ry="40" fill="#e8b26a" transform="rotate(-18 310 318)"/>
+<ellipse cx="200" cy="270" rx="21" ry="23" fill="#1b2409"/>
+<ellipse cx="312" cy="270" rx="21" ry="23" fill="#1b2409"/>
+<ellipse cx="193" cy="262" rx="7" ry="7" fill="#f5f3e8"/>
+<ellipse cx="305" cy="262" rx="7" ry="7" fill="#f5f3e8"/>
+<ellipse cx="256" cy="338" rx="28" ry="19" fill="#1b2409"/>
+<polygon points="250,352 262,352 262,382 250,382" fill="#1b2409"/>
+</svg>

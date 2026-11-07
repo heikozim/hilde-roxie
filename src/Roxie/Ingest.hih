@@ -1,0 +1,199 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The collector's side of /ingest: a batch of Roxie.Wire from an
+agent, with the host its token was given to, kept line by line in
+Wolly.LogStore.
+
+The host of every line is the owner of the token, never a field of the
+batch, so an agent can only write lines of its own host.  For each host
+the collector keeps the number of the batch it is at and how many of its
+lines it has kept: a batch sent again is kept on from there, an older
+one is answered as kept and changes nothing.  Keeping a line is not one
+transaction with that count (Standard.Search indexes in a transaction of
+its own), so a crash between the two can keep one line twice; no line is
+lost.
+
+Every batch is counted in Wolly.Metrics: roxie.batches, roxie.lines,
+roxie.errors (lines of level error) and roxie.refused (batches refused).
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.FcgiServer (
+    Request
+);
+import Roxie.Wire (
+    WireError
+);
+
+module Roxie.Ingest is
+    """
+    What became of a batch.
+    """
+    union IngestOutcome: Free is
+        """
+        count lines kept, from where the batch was before.
+        """
+        case Kept is
+            count: Int64;
+        """
+        The batch is older than the one the host is at, or kept whole
+        already; nothing changed.
+        """
+        case Repeated;
+        """
+        The owner of the token is no host name: a token given out for
+        something else.
+        """
+        case NotAHost;
+        """
+        The batch is refused, nothing kept.
+        """
+        case BadBatch is
+            reason: WireError;
+        """
+        SQLite refused a statement; the batch is taken back whole (one
+        transaction) and the agent sends it again.  step says
+        where, code is SQLite's (0 when a line was refused without one), for
+        the journal of the collector (storageLine); the agent learns
+        neither.
+        """
+        case IngestStorage is
+            step: Span[Nat8, Static];
+            code: Int32;
+    end;
+
+    """
+    Makes what the collector keeps: Wolly.LogStore, Wolly.Bearer,
+    Wolly.Metrics and the table of the batches of the hosts.  false when
+    SQLite refused one of them.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareIngest(db: &![Database[Writing], R]): Bool;
+
+    """
+    Keeps the batch in data for host at now.
+    """
+    generic [R: Region, H: Region, D: Region]
+    function ingest(db: &![Database[Writing], R], host: Span[Nat8, H], data: Span[Nat8, D], now: Int64): IngestOutcome
+        requires now >= 0;
+
+    """
+    The line of the journal for a batch not kept: where and SQLite's code,
+    nothing of the batch.
+    """
+    function storageLine(step: Span[Nat8, Static], code: Int32): String
+        ensures length(&result) > 0;
+
+    """
+    The CGI answer of an outcome: 200 with "kept N" or "repeated", 400 with
+    the line and the problem, 403 for NotAHost, 500 with no detail.
+    """
+    function ingestAnswer(outcome: IngestOutcome): String
+        ensures length(&result) > 0;
+
+    """
+    What a prune took: lines and samples, and whether it went through.
+    """
+    record PruneReport: Free is
+        lines: Int64;
+        samples: Int64;
+        whole: Bool;
+    end;
+
+    """
+    The most steps of 1000 lines one prune takes: 10000, ten million lines.
+    """
+    function mostPruneSteps(): Int64
+        ensures result = 10000;
+
+    """
+    Takes the lines (Wolly.LogStore.pruneLines, 1000 a step) and the samples
+    of Wolly.Metrics from before the time before out of the store.  whole is
+    false when SQLite refused a statement or the steps ran out; what was
+    taken stays taken, and a prune again goes on.
+    (before may be below 0: roxie prune 36500 reaches before 1970, and nothing is older; no requires.)
+    """
+    generic [R: Region]
+    function pruneBefore(db: &![Database[Writing], R], before: Int64): PruneReport
+        ensures (result.lines >= 0) and (result.samples >= 0);
+
+    """
+    What relevelLines did: the lines it read, the lines whose level it
+    changed, and whether it went through.
+    """
+    record RelevelReport: Free is
+        seen: Int64;
+        changed: Int64;
+        whole: Bool;
+    end;
+
+    """
+    One step of relevel after the line after: a part of what relevelLines
+    does, for a caller that pauses between steps (roxie relevel).
+    """
+    record RelevelPart: Free is
+        seen: Int64;
+        changed: Int64;
+        last: Int64;
+        whole: Bool;
+    end;
+
+    """
+    The lines after the line after, at most 1000, read without a write
+    lock, and those whose level differs given the new one, at most 10 a
+    transaction.  seen 0 when there is no line after it.
+    """
+    generic [R: Region]
+    function relevelAfter(db: &![Database[Writing], R], after: Int64): RelevelPart
+        requires after >= 0
+        ensures (result.seen >= 0) and ((result.changed >= 0) and (result.changed <= result.seen));
+
+    """
+    Gives every kept line the level Roxie.Line.lineLevel finds in its text
+    now, where that is another: in the table of lines and in the
+    title of its row of the full-text index, which Wolly.Query compares.
+    The steps of relevelAfter one after the other, without a pause; a
+    second run changes nothing.  whole is false when SQLite refused a
+    statement; what was changed stays changed, and a run again goes on.
+    """
+    generic [R: Region]
+    function relevelLines(db: &![Database[Writing], R]): RelevelReport
+        ensures (result.seen >= 0) and (result.changed >= 0) and (result.changed <= result.seen);
+
+    """
+    The host a client certificate names: the value of CN in subject, the
+    subject DN as Hiawatha gives it in TLS_SUBJECT_DN (mbed TLS writes
+    "CN=server" or "O=Heiko, CN=server", the fields after ", "), when it is
+    a host name of small letters (Wolly.Net.validHostname); None when there
+    is no CN, CN is there twice, or it is no such name.
+
+    No contract: a parser of foreign input answering an Option.
+    """
+    generic [S: Region]
+    function certificateHost(subject: Span[Nat8, S]): Option[String];
+
+    """
+    The answer to a request to /ingest: 405 for any
+    method but POST; 403 without a client certificate (no TLS_SUBJECT_DN,
+    which only the web server sets) or with one that names no host; 401
+    without a token or with one no host owns; 403 when the token's host is
+    not the certificate's; else ingestAnswer of the batch in its body, for
+    that host.
+    """
+    generic [R: Region, Q: Region]
+    function answerIngest(db: &![Database[Writing], R], request: &[Request, Q], now: Int64): String
+        requires now >= 0;
+end module.

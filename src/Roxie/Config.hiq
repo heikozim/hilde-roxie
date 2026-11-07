@@ -1,0 +1,381 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Two passes: the first finds and checks where each value lies, holding
+-- nothing linear; the second makes the configuration of those places.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan
+);
+import Standard.Text (
+    substring,
+    parseInt
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    lengthMut,
+    remove,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.HttpClient (
+    Target,
+    parseUrl,
+    destroyTarget
+);
+import Wolly.LogStore (
+    isSource
+);
+
+module body Roxie.Config is
+    constant files_most: Index := 64;
+    constant every_most: Int64 := 3600;
+    constant report_usual: Int64 := 600;
+    constant report_most: Int64 := 86400;
+
+    -- Where a value lies, and on which line.
+    record Place: Free is
+        first: Index;
+        stop: Index;
+        line: Index;
+    end;
+
+    -- What the first pass found.
+    record Found: Free is
+        collector: Option[Place];
+        ca: Option[Place];
+        certificate: Option[Place];
+        key: Option[Place];
+        token: Option[Place];
+        state: Option[Place];
+        every: Int64;
+        everyLine: Index;
+        report: Int64;
+        reportLine: Index;
+    end;
+
+    function mostFiles(): Index is
+        return files_most;
+    end;
+
+    function defaultReport(): Int64 is
+        return report_usual;
+    end;
+
+    function mostReport(): Int64 is
+        return report_most;
+    end;
+
+    function configProblemName(problem: ConfigProblem): Span[Nat8, Static] is
+        case problem of
+            when NotASetting do
+                return "NotASetting";
+            when UnknownSetting do
+                return "UnknownSetting";
+            when GivenTwice do
+                return "GivenTwice";
+            when BadSetting do
+                return "BadSetting";
+            when MissingSetting do
+                return "MissingSetting";
+            when TooManyFiles do
+                return "TooManyFiles";
+        end case;
+    end;
+
+    function isSpace(byte: Nat8): Bool is
+        return (byte = ' ') or (byte = 9);
+    end;
+
+    -- Whether the text from first to before stop is word.
+    generic [T: Region]
+    function isWord(text: Span[Nat8, T], first: Index, stop: Index, word: Span[Nat8, Static]): Bool is
+        if (stop - first) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if text[first + i] /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- A path: a source of Wolly.LogStore that begins with a slash.
+    generic [V: Region]
+    function isPath(value: Span[Nat8, V]): Bool is
+        if not isSource(value) then
+            return false;
+        end if;
+        return value[0] = '/';
+    end;
+
+    generic [V: Region]
+    function isCollector(value: Span[Nat8, V]): Bool is
+        case parseUrl(value) of
+            when Some(value as target: Target) do
+                destroyTarget(target);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(line: Index, problem: ConfigProblem): Either[ConfigError, Found] is
+        return Left(left => ConfigError(line => line, problem => problem));
+    end;
+
+    -- The first pass: every value checked and where it lies; the places of
+    -- the files go into files.
+    generic [T: Region, F: Region]
+    function scan(text: Span[Nat8, T], files: &![Buffer[Place], F]): Either[ConfigError, Found] is
+        var collector: Option[Place] := None();
+        var ca: Option[Place] := None();
+        var certificate: Option[Place] := None();
+        var key: Option[Place] := None();
+        var token: Option[Place] := None();
+        var state: Option[Place] := None();
+        var every: Int64 := 0;
+        var every_line: Index := 0;
+        var report: Int64 := report_usual;
+        var report_line: Index := 0;
+        let size: Index := spanLength(text);
+        var line: Index := 0;
+        var at: Index := 0;
+        while at < size do
+            line := line + 1;
+            var stop: Index := at;
+            while (stop < size) and (text[stop] /= 10) do
+                stop := stop + 1;
+            end while;
+            let next: Index := stop + 1;
+            while (stop > at) and (isSpace(text[stop - 1]) or (text[stop - 1] = 13)) do
+                stop := stop - 1;
+            end while;
+            var first: Index := at;
+            while (first < stop) and isSpace(text[first]) do
+                first := first + 1;
+            end while;
+            if (first < stop) and (text[first] /= '#') then
+                var name_end: Index := first;
+                while (name_end < stop) and (not isSpace(text[name_end])) do
+                    name_end := name_end + 1;
+                end while;
+                var value_start: Index := name_end;
+                while (value_start < stop) and isSpace(text[value_start]) do
+                    value_start := value_start + 1;
+                end while;
+                if value_start = stop then
+                    return refused(line, NotASetting());
+                end if;
+                let value: Span[Nat8, T] := substring(text, value_start, stop);
+                let place: Place := Place(first => value_start, stop => stop, line => line);
+                if isWord(text, first, name_end, "collector") then
+                    if not isCollector(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    case collector of
+                        when Some(value as before: Place) do
+                            return refused(line, GivenTwice());
+                        when None do
+                            let some: Option[Place] := Some(value => place);
+                            collector := some;
+                    end case;
+                else if isWord(text, first, name_end, "ca") then
+                    if not isPath(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    case ca of
+                        when Some(value as before: Place) do
+                            return refused(line, GivenTwice());
+                        when None do
+                            let some: Option[Place] := Some(value => place);
+                            ca := some;
+                    end case;
+                else if isWord(text, first, name_end, "certificate") then
+                    if not isPath(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    case certificate of
+                        when Some(value as before: Place) do
+                            return refused(line, GivenTwice());
+                        when None do
+                            let some: Option[Place] := Some(value => place);
+                            certificate := some;
+                    end case;
+                else if isWord(text, first, name_end, "key") then
+                    if not isPath(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    case key of
+                        when Some(value as before: Place) do
+                            return refused(line, GivenTwice());
+                        when None do
+                            let some: Option[Place] := Some(value => place);
+                            key := some;
+                    end case;
+                else if isWord(text, first, name_end, "token") then
+                    if not isPath(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    case token of
+                        when Some(value as before: Place) do
+                            return refused(line, GivenTwice());
+                        when None do
+                            let some: Option[Place] := Some(value => place);
+                            token := some;
+                    end case;
+                else if isWord(text, first, name_end, "state") then
+                    if not isPath(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    case state of
+                        when Some(value as before: Place) do
+                            return refused(line, GivenTwice());
+                        when None do
+                            let some: Option[Place] := Some(value => place);
+                            state := some;
+                    end case;
+                else if isWord(text, first, name_end, "every") then
+                    if every_line > 0 then
+                        return refused(line, GivenTwice());
+                    end if;
+                    var seconds: Int64 := 0;
+                    if spanLength(value) <= 4 then
+                        case parseInt(value) of
+                            when Some(value as parsed: Int64) do
+                                seconds := parsed;
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    if (seconds < 1) or (seconds > every_most) then
+                        return refused(line, BadSetting());
+                    end if;
+                    every := seconds;
+                    every_line := line;
+                else if isWord(text, first, name_end, "report") then
+                    if report_line > 0 then
+                        return refused(line, GivenTwice());
+                    end if;
+                    var quiet: Int64 := -1;
+                    if spanLength(value) <= 5 then
+                        case parseInt(value) of
+                            when Some(value as parsed: Int64) do
+                                quiet := parsed;
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    if (quiet < 0) or (quiet > report_most) then
+                        return refused(line, BadSetting());
+                    end if;
+                    report := quiet;
+                    report_line := line;
+                else if isWord(text, first, name_end, "file") then
+                    if not isPath(value) then
+                        return refused(line, BadSetting());
+                    end if;
+                    if lengthMut(&~files) >= files_most then
+                        return refused(line, TooManyFiles());
+                    end if;
+                    insertBack(&~files, place);
+                else
+                    return refused(line, UnknownSetting());
+                end if;
+            end if;
+            at := next;
+        end while;
+        if (every_line = 0) or (lengthMut(&~files) = 0) then
+            return refused(0, MissingSetting());
+        end if;
+        return Right(right => Found(collector => collector, ca => ca, certificate => certificate, key => key, token => token,
+                                    state => state, every => every, everyLine => every_line, report => report,
+                                    reportLine => report_line));
+    end;
+
+    -- The text of the place, or empty for none.
+    generic [T: Region]
+    function textOf(text: Span[Nat8, T], place: Option[Place]): String is
+        case place of
+            when Some(value as found: Place) do
+                return fromSpan(substring(text, found.first, found.stop));
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function present(place: Option[Place]): Bool is
+        case place of
+            when Some(value as found: Place) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [T: Region, F: Region]
+    function filesOf(text: Span[Nat8, T], places: &[Buffer[Place], F]): Buffer[String] is
+        var files: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(places) do
+            let place: Place := nth(places, i);
+            insertBack(&!files, fromSpan(substring(text, place.first, place.stop)));
+            i := i + 1;
+        end while;
+        return files;
+    end;
+
+    generic [T: Region]
+    function readConfig(text: Span[Nat8, T]): Either[ConfigError, AgentConfig] is
+        var places: Buffer[Place] := allocateEmpty();
+        let scanned: Either[ConfigError, Found] := scan(text, &!places);
+        case scanned of
+            when Left(left as error: ConfigError) do
+                destroyFree(places);
+                return Left(left => error);
+            when Right(right as found: Found) do
+                let reached: Bool := (present(found.collector) and present(found.ca)) and (present(found.token) and present(found.state));
+                let complete: Bool := reached and (present(found.certificate) and present(found.key));
+                if not complete then
+                    destroyFree(places);
+                    return Left(left => ConfigError(line => 0, problem => MissingSetting()));
+                else
+                    let files: Buffer[String] := filesOf(text, &places);
+                    destroyFree(places);
+                    return Right(right => AgentConfig(collector => textOf(text, found.collector), ca => textOf(text, found.ca),
+                                                      certificate => textOf(text, found.certificate), key => textOf(text, found.key),
+                                                      token => textOf(text, found.token), state => textOf(text, found.state),
+                                                      every => found.every, report => found.report, files => files));
+                end if;
+        end case;
+    end;
+
+    function destroyConfig(config: AgentConfig): Unit is
+        let { collector as a: String, ca as b: String, certificate as g: String, key as h: String, token as c: String,
+              state as d: String, every as e: Int64, report as r: Int64, files as f: Buffer[String] } := config;
+        destroyString(a);
+        destroyString(b);
+        destroyString(g);
+        destroyString(h);
+        destroyString(c);
+        destroyString(d);
+        var rest: Buffer[String] := f;
+        while lengthMut(&!rest) > 0 do
+            let last: Index := lengthMut(&!rest) - 1;
+            destroyString(remove(&!rest, last));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+end module body.

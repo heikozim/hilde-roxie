@@ -1,0 +1,18 @@
+roxie (0.1) stable; urgency=low
+
+  * Agent: reads the new lines of its log files, their time and level
+    from syslog (RFC 3339 and the BSD form), Hiawatha, a priority, a JSON
+    or logfmt field, guesses the level of the rest, and sends numbered
+    batches over HTTPS with a client certificate and a token per host.
+  * Agent confines itself: pledge and unveil on OpenBSD, Landlock and
+    seccomp on Linux.
+  * Collector: a FastCGI application behind Hiawatha; keeps the lines with
+    full-text search, counts them, prunes and relevels them.
+  * Dashboard drawn on the server with htmx: panels of the hosts, search
+    with the query language of Wolly.Query, a help page, the build version
+    in the footer.
+  * Sign-in through OpenID Connect; GET /api/query with a reader token;
+    roxie query with --json, --limit and --since.
+  * Contracts on every public function, checked by a lint.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Tue, 03 Nov 2026 20:00:00 +0100

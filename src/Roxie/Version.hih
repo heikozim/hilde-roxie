@@ -1,0 +1,36 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The version of the programme, from its build: the tag
+of git the tree stood at, given to the build as --build-value=version=...
+by scripts/build-binary.sh and read through Standard.BuildInfo, never
+typed in.  The footer of the pages, roxie --version and the JSON of roxie
+query show it.
+
+    numberOf("v0.1.0-3-gabcdef1")   0.1.0
+    numberOf("v")                    an empty span
+    versionNumber()                  0.1.0, or dev for a build without a tag
+"""
+
+module Roxie.Version is
+    """
+    The number of version: without its v and without all from its first
+    minus on.  An empty span when version holds a byte other than a
+    letter, a digit, a dot, a minus or a plus, or when no digit starts
+    the number, so a number given back needs no escaping anywhere.
+    """
+    generic [V: Region]
+    function numberOf(version: Span[Nat8, V]): Span[Nat8, V]
+        ensures spanLength(result) <= spanLength(version);
+
+    """
+    The number of the version the build was given, or dev when it was
+    given none or none that is a version.
+    """
+    function versionNumber(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

@@ -1,0 +1,51 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What an agent may reach once its configuration and token are read
+, as a policy of Standard.Sandbox: pledge and unveil on OpenBSD,
+Landlock and seccomp on Linux.
+
+- The promises: stdio rpath wpath cpath flock inet dns.
+- Read: the CA file, the certificate, the key, /etc/resolv.conf,
+  /etc/hosts, and the directory of each file of the configuration, so
+  that a log rotated to a new file of the same name stays in reach
+  (Landlock holds a file by its inode).
+- Read, write and create: the directory of the state, where SQLite keeps
+  its journal beside the database.
+- Nothing else is granted; whatever lies in a granted directory is in
+  reach, so the configuration and the token belong elsewhere.
+
+    let policy: Policy := agentPolicy(&config);
+    let report: Report := applyPolicy(policy);
+"""
+import Standard.Sandbox (
+    Policy
+);
+import Roxie.Config (
+    AgentConfig
+);
+
+module Roxie.Confine is
+    """
+    The promises of an agent, in the words of pledge.
+    """
+    function agentPromises(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The policy of the agent of config.  The directory of the state is
+    the part of its path before the last /, and so is the directory of
+    a file.  The root is never granted: the agent of a state or a file
+    directly under / cannot reach it.
+    The tests compare describePaths of it.
+
+    No contract: a Policy is opaque and its count is read through a
+    borrow, which a condition on the result cannot take.
+    """
+    generic [C: Region]
+    function agentPolicy(config: &[AgentConfig, C]): Policy;
+end module.

@@ -1,0 +1,265 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nthRef
+);
+import Standard.HttpClient (
+    Method,
+    Post,
+    Limits,
+    Failure,
+    Response,
+    requestAs,
+    destroyFailure
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Wolly.Secret (
+    readKey
+);
+import Roxie.Config (
+    AgentConfig
+);
+import Standard.Calendar (
+    Zone
+);
+import Roxie.Outbox (
+    CollectFailure,
+    NotASource,
+    NotReadable,
+    CollectStorage,
+    Pending,
+    collectFile,
+    nextBatch,
+    batchTaken,
+    setAside
+);
+
+module body Roxie.Agent is
+    constant sends_most: Int64 := 100;
+    constant token_digits: Index := 64;
+
+    -- What sending one batch did.
+    record Sent: Free is
+        verdict: SendVerdict;
+        status: Nat16;
+    end;
+
+    function mostSends(): Int64 is
+        return sends_most;
+    end;
+
+    function movedAnything(report: RoundReport): Bool is
+        return ((report.collected > 0) or (report.taken > 0)) or ((report.setAside > 0) or report.keptBack);
+    end;
+
+    function freshTally(said: Int64): Tally is
+        return Tally(collected => 0, taken => 0, setAside => 0, rounds => 0, said => said);
+    end;
+
+    function counted(tally: Tally, report: RoundReport): Tally is
+        return Tally(collected => tally.collected + report.collected, taken => tally.taken + report.taken,
+                     setAside => tally.setAside + report.setAside, rounds => tally.rounds + 1, said => tally.said);
+    end;
+
+    function dueAt(tally: Tally, report: RoundReport, now: Int64, every: Int64): Bool is
+        if report.keptBack or (report.setAside > 0) then
+            return true;
+        end if;
+        if (tally.collected = 0) and (tally.taken = 0) then
+            return false;
+        end if;
+        if (tally.said = 0) or (now < tally.said) then
+            return true;
+        end if;
+        return (now - tally.said) >= every;
+    end;
+
+    function verdictOf(status: Nat16): SendVerdict is
+        if status = 200 then
+            return TakenAway();
+        end if;
+        if status = 400 then
+            return PutAside();
+        end if;
+        return KeptBack();
+    end;
+
+    function isHexDigit(byte: Nat8): Bool is
+        return ((byte >= '0') and (byte <= '9')) or ((byte >= 'a') and (byte <= 'f'));
+    end;
+
+    -- Whether text, the line end cut, is 64 hex digits.
+    generic [T: Region]
+    function tokenLength(text: Span[Nat8, T]): Index is
+        var stop: Index := spanLength(text);
+        while (stop > 0) and (((text[stop - 1] = 10) or (text[stop - 1] = 13)) or (text[stop - 1] = ' ')) do
+            stop := stop - 1;
+        end while;
+        if stop /= token_digits then
+            return 0;
+        end if;
+        var i: Index := 0;
+        while i < stop do
+            if not isHexDigit(text[i]) then
+                return 0;
+            end if;
+            i := i + 1;
+        end while;
+        return stop;
+    end;
+
+    generic [P: Region]
+    function readToken(path: Span[Nat8, P]): Option[String] is
+        case readKey(path) of
+            when Some(value as content: String) do
+                let size: Index := tokenLength(asSpan(&content));
+                if size = 0 then
+                    destroyString(content);
+                    return None();
+                else
+                    let token: String := fromSpan(substring(asSpan(&content), 0, size));
+                    destroyString(content);
+                    return Some(value => token);
+                end if;
+            when None do
+                return None();
+        end case;
+    end;
+
+    function limits(): Limits is
+        return Limits(connectMillis => 10000, totalMillis => 30000, maximumBytes => 65536, publicOnly => false);
+    end;
+
+    -- POSTs data to the collector of config over mutual TLS (the design,
+    -- Standard.HttpClient.requestAs of Hilde GX): the agent shows its
+    -- certificate and key; the status, 0 when the request failed.
+    generic [C: Region, T: Region, D: Region]
+    function post(config: &[AgentConfig, C], token: Span[Nat8, T], data: Span[Nat8, D]): Nat16 is
+        var headers: StringBuilder := makeStringBuilder();
+        writeString(&!headers, "Authorization: Bearer ");
+        writeString(&!headers, token);
+        writeString(&!headers, "\r\nContent-Type: text/plain; charset=utf-8");
+        let lines: String := finalize(headers);
+        let answer: Either[Failure, Response] := requestAs(Post(), asSpan(&(config->collector)), asSpan(&lines), data,
+                                                           asSpan(&(config->ca)), asSpan(&(config->certificate)),
+                                                           asSpan(&(config->key)), limits());
+        destroyString(lines);
+        case answer of
+            when Right(right as response: Response) do
+                let { status as status: Nat16, headers as answer_headers: String, content as answer_content: String } := response;
+                destroyString(answer_headers);
+                destroyString(answer_content);
+                return status;
+            when Left(left as failure: Failure) do
+                destroyFailure(failure);
+                let none: Nat16 := 0;
+                return none;
+        end case;
+    end;
+
+    -- Sends the oldest batch and acts on the answer; None when the outbox
+    -- is empty.
+    generic [R: Region, C: Region, T: Region]
+    function sendOne(db: &![Database[Writing], R], config: &[AgentConfig, C], token: Span[Nat8, T]): Option[Sent] is
+        case nextBatch(&~db) of
+            when Left(left as error: DbError) do
+                return Some(value => Sent(verdict => KeptBack(), status => 0));
+            when Right(right as found: Option[Pending]) do
+                case found of
+                    when None do
+                        return None();
+                    when Some(value as pending: Pending) do
+                        let { number as number: Int64, data as data: String } := pending;
+                        let status: Nat16 := post(config, token, asSpan(&data));
+                        destroyString(data);
+                        let verdict: SendVerdict := verdictOf(status);
+                        case verdict of
+                            when TakenAway do
+                                case batchTaken(&~db, number) of
+                                    when Left(left as error: DbError) do
+                                        return Some(value => Sent(verdict => KeptBack(), status => status));
+                                    when Right(right as was: Bool) do
+                                        return Some(value => Sent(verdict => verdict, status => status));
+                                end case;
+                            when PutAside do
+                                case setAside(&~db, number, "status 400") of
+                                    when Left(left as error: DbError) do
+                                        return Some(value => Sent(verdict => KeptBack(), status => status));
+                                    when Right(right as was: Bool) do
+                                        return Some(value => Sent(verdict => verdict, status => status));
+                                end case;
+                            when KeptBack do
+                                return Some(value => Sent(verdict => verdict, status => status));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, C: Region, T: Region, Z: Region]
+    function round(db: &![Database[Writing], R], config: &[AgentConfig, C], token: Span[Nat8, T], zone: &[Zone, Z], now: Int64): RoundReport is
+        var collected: Int64 := 0;
+        var unreadable: Int64 := 0;
+        let files: &[Buffer[String], C] := &(config->files);
+        var i: Index := 0;
+        while i < length(files) do
+            case collectFile(&~db, asSpan(nthRef(files, i)), zone, now) of
+                when Right(right as count: Int64) do
+                    collected := collected + count;
+                when Left(left as failure: CollectFailure) do
+                    unreadable := unreadable + 1;
+            end case;
+            i := i + 1;
+        end while;
+        var taken: Int64 := 0;
+        var aside: Int64 := 0;
+        var kept: Bool := false;
+        var status: Nat16 := 0;
+        var sends: Int64 := 0;
+        var going: Bool := true;
+        while going and (sends < sends_most) do
+            case sendOne(&~db, config, token) of
+                when None do
+                    going := false;
+                when Some(value as sent: Sent) do
+                    status := sent.status;
+                    case sent.verdict of
+                        when TakenAway do
+                            taken := taken + 1;
+                        when PutAside do
+                            aside := aside + 1;
+                        when KeptBack do
+                            kept := true;
+                            going := false;
+                    end case;
+            end case;
+            sends := sends + 1;
+        end while;
+        return RoundReport(collected => collected, taken => taken, setAside => aside, unreadable => unreadable, keptBack => kept,
+                           status => status);
+    end;
+end module body.

@@ -1,0 +1,2433 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The handlers open the database for each request, as Wolly's examples
+-- do: a handler of Standard.FcgiServer is a plain function.  Every page
+-- but the style sheet, the form to log in and /ingest asks for a session;
+-- /ingest asks for a token (Roxie.Ingest).
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    parseInt,
+    bytesToHex
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    closeDatabase,
+    begin,
+    commit,
+    isBusy
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Task (
+    sleepFor
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile,
+    statusOf,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    FileStatus,
+    sameKind,
+    kindRegular,
+    kindOther
+);
+import Standard.Log (
+    Log,
+    Info,
+    JsonLines,
+    logToFile,
+    closeLog
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    watchSignals,
+    waitSignal,
+    shutdownRequested,
+    stopWatching
+);
+import Standard.FcgiServer (
+    Request,
+    Limits,
+    defaultLimits,
+    requestParam,
+    destroyRequest
+);
+import Wolly.Request (
+    formValue,
+    query
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish,
+    decimalText
+);
+import Wolly.Router (
+    Route,
+    routeParam
+);
+import Wolly.Middleware (
+    Step,
+    dispatchWith,
+    dispatchLogged,
+    knownMethods,
+    securityHeaders
+);
+import Wolly.Server (
+    Outcome,
+    Stopped,
+    NoSocket,
+    NotStarted,
+    serve
+);
+import Wolly.Secret (
+    readKey,
+    makeKey
+);
+import Wolly.Guard (
+    formToken,
+    changeAllowed
+);
+import Wolly.Pseudonym (
+    pseudonym
+);
+import Wolly.Auth (
+    AuthError,
+    prepareAuth,
+    addUser,
+    logout,
+    visitorSession,
+    sessionUser,
+    sessionToken,
+    withSessionCookie,
+    withoutSessionCookie,
+    externalLogin,
+    isUserName
+);
+import Wolly.Rambo (
+    RamboConfig,
+    RamboStart,
+    RamboPending,
+    RamboTokens,
+    RamboError,
+    destroyRamboConfig,
+    reauthSeconds,
+    beginLogin,
+    destroyRamboError,
+    exchangeCode,
+    fetchJwks,
+    verifiedPayload,
+    idTokenProblem,
+    claimText,
+    prepareRambo,
+    keepPending,
+    takePending,
+    keepIdToken,
+    takeIdToken,
+    logoutForm,
+    logoutPolicy
+);
+import Roxie.Sign (
+    readSignConfig,
+    signedOutUri,
+    prepareSign,
+    bindSub,
+    userOfSub,
+    unbindUser
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Wolly.Bearer (
+    issueToken,
+    revokeTokens
+);
+import Standard.Htmx (
+    requestVariable,
+    isHtmxRequest,
+    scriptResponse
+);
+import Wolly.Dashboard (
+    Panel,
+    Live,
+    DashboardFailure,
+    findPanel,
+    livePanelFragment,
+    liveDashboardPage
+);
+import Roxie.Wire (
+    mostBatchBytes
+);
+import Roxie.Ingest (
+    PruneReport,
+    RelevelPart,
+    prepareIngest,
+    answerIngest,
+    pruneBefore,
+    relevelAfter
+);
+import Roxie.Web (
+    roxiePanels,
+    hostsPanel,
+    dashboardTop,
+    searchPage,
+    helpPage,
+    footer,
+    withFooter
+);
+import Roxie.Find (
+    Answer,
+    defaultShown,
+    answerQuery,
+    storageAnswer
+);
+import Roxie.Version (
+    versionNumber
+);
+import Roxie.Reader (
+    readerOwner,
+    answerReader
+);
+import Wolly.Net (
+    validHostname
+);
+import Wolly.AuditLog (
+    prune as pruneAuditLog
+);
+import Standard.Arguments (
+    Command,
+    makeCommand,
+    destroyCommand,
+    setVersion,
+    setCopyright,
+    setFullVersion,
+    setInfo,
+    addVerbose,
+    addJson,
+    addSandbox,
+    addSocket,
+    addCompletion,
+    addManual,
+    option,
+    addWhole,
+    addText,
+    addPositional,
+    addSubcommand,
+    FlagKey,
+    WholeKey,
+    TextKey,
+    PathKey,
+    PositionalKey,
+    SubcommandKey,
+    Outcome as ArgumentOutcome,
+    Run,
+    Help,
+    Version,
+    Matches,
+    ArgumentError,
+    processArguments,
+    destroyArguments,
+    parse,
+    destroyMatches,
+    describeError,
+    destroyError,
+    flagCount,
+    wholeOf,
+    textOf,
+    pathOf,
+    positionalOf,
+    positionalCount,
+    positionalAt,
+    chosen
+);
+import Standard.About (
+    fullVersion,
+    info
+);
+import Standard.Paths (
+    Service,
+    UserTool,
+    SocketFile,
+    choosePath
+);
+import Standard.Doctor (
+    Checkup,
+    makeCheckup,
+    addResult,
+    runCheckup,
+    destroyCheckup
+);
+import Standard.Sandbox (
+    Report,
+    applyPolicy,
+    reportApplied,
+    describeReport,
+    queryNoNewPrivileges,
+    querySeccomp
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardError,
+    acquireError,
+    releaseError,
+    writeErrorText
+);
+import Roxie.Config (
+    ConfigError,
+    AgentConfig,
+    readConfig,
+    destroyConfig,
+    configProblemName
+);
+import Roxie.Outbox (
+    prepareOutbox,
+    startNumbersAt
+);
+import Roxie.Agent (
+    RoundReport,
+    Tally,
+    movedAnything,
+    freshTally,
+    counted,
+    dueAt,
+    readToken,
+    round
+);
+import Standard.Calendar (
+    Zone,
+    ZoneFailure,
+    localZone,
+    utcZone,
+    destroyZone
+);
+import Roxie.Confine (
+    agentPolicy
+);
+
+module body Roxie.App is
+    constant database_path: Span[Nat8, Static] := "roxie.db";
+    constant key_path: Span[Nat8, Static] := "csrf.key";
+    constant pseudonym_key_path: Span[Nat8, Static] := "pseudonym.key";
+    constant audit_path: Span[Nat8, Static] := "audit.log";
+    constant access_path: Span[Nat8, Static] := "access.log";
+    constant known_passwords_path: Span[Nat8, Static] := "known-passwords.txt";
+    constant socket_path: Span[Nat8, Static] := "roxie.sock";
+    -- script-src and connect-src for htmx: its script from
+    -- /htmx.min.js, and the fragments it asks for.
+    constant page_policy: Span[Nat8, Static] := "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'";
+    -- The script of htmx in the working directory, put there by the
+    -- operator; without it /htmx.min.js answers 404 and the
+    -- dashboard loads itself again as a whole.
+    constant htmx_path: Span[Nat8, Static] := "htmx.min.js";
+    -- The page that turns the second factor on shows its QR code as a
+    -- data URI; the other pages show the icons of ROXIE, files of the
+    -- site, and no other image.
+    constant totp_policy: Span[Nat8, Static] := "default-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'";
+    constant refresh_seconds: Int64 := 60;
+    -- The pause between two steps of roxie relevel, in ms.
+    constant relevel_pause: Nat32 := 200;
+
+    -- How the dashboard keeps itself fresh: each panel asks for
+    -- /panel/<name> every minute (Wolly.Dashboard of Wolly).
+    function live(): Live is
+        return Live(base => "/panel/", script => "/htmx.min.js", every => refresh_seconds);
+    end;
+    constant config_most: Index := 65536;
+
+    function now(): Int64 is
+        let ten9: Nat64 := 1000000000;
+        case toInt64(wallNanos() / ten9) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameWord(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- Answers
+    ---
+
+    function guarded(status: Nat16, content_type: Span[Nat8, Static]): Response is
+        let cached: Response := addHeader(makeResponse(status, content_type), "Cache-Control", "no-store");
+        return addHeader(cached, "Content-Security-Policy", page_policy);
+    end;
+
+    function plain(status: Nat16, text: Span[Nat8, Static]): String is
+        return finish(guarded(status, "text/plain; charset=utf-8"), text);
+    end;
+
+    function redirect(target: Span[Nat8, Static]): String is
+        return finish(addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", target), "see other\n");
+    end;
+
+    -- An answer of HTML; a whole page gets the foot of ROXIE before its
+    -- </body>, a panel goes as it is.
+    generic [B: Region]
+    function html(status: Nat16, page: Span[Nat8, B]): String is
+        let foot: String := footer();
+        let whole: String := withFooter(page, asSpan(&foot));
+        destroyString(foot);
+        let output: String := finish(guarded(status, "text/html; charset=utf-8"), asSpan(&whole));
+        destroyString(whole);
+        return output;
+    end;
+
+    -- The pseudonym of the client the web server names; unknown without
+    -- the key.
+    generic [R: Region]
+    function client(request: &[Request, R]): String is
+        case requestParam(request, "REMOTE_ADDR") of
+            when Some(value as address: String) do
+                case readKey(pseudonym_key_path) of
+                    when Some(value as key: String) do
+                        let made: Option[String] := pseudonym(asSpan(&key), asSpan(&address));
+                        destroyString(key);
+                        destroyString(address);
+                        case made of
+                            when Some(value as named: String) do
+                                return named;
+                            when None do
+                                return fromSpan("unknown");
+                        end case;
+                    when None do
+                        destroyString(address);
+                        return fromSpan("unknown");
+                end case;
+            when None do
+                return fromSpan("unknown");
+        end case;
+    end;
+
+    -- The form token of the session of token, empty without the key.
+    generic [T: Region]
+    function tokenForForm(token: Span[Nat8, T]): String is
+        case readKey(key_path) of
+            when Some(value as key: String) do
+                case formToken(asSpan(&key), token) of
+                    when Some(value as csrf: String) do
+                        destroyString(key);
+                        return csrf;
+                    when None do
+                        destroyString(key);
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- Whether request may change something in the session of token.
+    generic [R: Region, T: Region]
+    function allowed(request: &[Request, R], token: Span[Nat8, T]): Bool is
+        case readKey(key_path) of
+            when Some(value as key: String) do
+                let taken: Bool := changeAllowed(request, asSpan(&key), token);
+                destroyString(key);
+                return taken;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function field(request: &[Request, R], name: Span[Nat8, Static]): String is
+        case formValue(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    ---
+    --- Pages behind a session
+    ---
+
+    -- What a page behind a session needs: the request, the token of its
+    -- session and the database.  Each handler below is one of these.
+    union Page: Free is
+        case Home;
+        case Search;
+        case HelpPage;
+        case PanelPart;
+    end;
+
+    -- The answer of page for a user with the session token.
+    generic [R: Region, Q: Region, T: Region]
+    function pageFor(db: &![Database[Writing], R], request: &[Request, Q], token: Span[Nat8, T], page: Page): String is
+        let csrf: String := tokenForForm(token);
+        case page of
+            when Home do
+                let head: String := dashboardTop("", asSpan(&csrf));
+                destroyString(csrf);
+                --: the panels of the hosts after the search field.
+                let hosts: Either[DbError, String] := hostsPanel(&~db, now(), refresh_seconds);
+                var both: StringBuilder := makeStringBuilder();
+                writeString(&!both, asSpan(&head));
+                destroyString(head);
+                case hosts of
+                    when Right(right as part: String) do
+                        writeString(&!both, asSpan(&part));
+                        destroyString(part);
+                    when Left(left as error: DbError) do
+                        storageNote("/ the panels of the hosts", error.code);
+                        writeString(&!both, "<p class=\"roxie-problem\">The panels of the hosts could not be read.</p>");
+                end case;
+                let top: String := finalize(both);
+                let panels: Buffer[Panel] := roxiePanels();
+                let made: Either[DashboardFailure, String] := liveDashboardPage(&~db, &panels, "ROXIE", "/style.css", asSpan(&top),
+                                                                             now(), live());
+                destroyFree(panels);
+                destroyString(top);
+                case made of
+                    when Right(right as text: String) do
+                        let output: String := html(200, asSpan(&text));
+                        destroyString(text);
+                        return output;
+                    when Left(left as failure: DashboardFailure) do
+                        dashboardNote("/", failure);
+                        return plain(500, "internal server error\n");
+                end case;
+            when Search do
+                let text: String := orEmpty(query(request, "q"));
+                let offset: Int64 := offsetOf(request);
+                let made: Either[DbError, String] := searchPage(&~db, asSpan(&text), offset, now(), asSpan(&csrf));
+                destroyString(text);
+                destroyString(csrf);
+                case made of
+                    when Right(right as searched: String) do
+                        let output: String := html(200, asSpan(&searched));
+                        destroyString(searched);
+                        return output;
+                    when Left(left as error: DbError) do
+                        storageNote("/search", error.code);
+                        return plain(500, "internal server error\n");
+                end case;
+            when HelpPage do
+                let made: String := helpPage(now(), asSpan(&csrf));
+                destroyString(csrf);
+                let output: String := html(200, asSpan(&made));
+                destroyString(made);
+                return output;
+            when PanelPart do
+                destroyString(csrf);
+                let name: String := orEmpty(routeParam(request, "/panel/:name", "name"));
+                if sameWord(asSpan(&name), "hosts") then
+                    destroyString(name);
+                    case hostsPanel(&~db, now(), refresh_seconds) of
+                        when Right(right as part: String) do
+                            let output: String := html(200, asSpan(&part));
+                            destroyString(part);
+                            return output;
+                        when Left(left as error: DbError) do
+                            storageNote("/panel/hosts", error.code);
+                            return plain(500, "internal server error\n");
+                    end case;
+                end if;
+                let panels: Buffer[Panel] := roxiePanels();
+                let found: Option[Panel] := findPanel(&panels, asSpan(&name));
+                destroyFree(panels);
+                case found of
+                    when Some(value as panel: Panel) do
+                        case livePanelFragment(&~db, panel, now(), live()) of
+                            when Right(right as part: String) do
+                                destroyString(name);
+                                let output: String := html(200, asSpan(&part));
+                                destroyString(part);
+                                return output;
+                            when Left(left as error: DbError) do
+                                var where: StringBuilder := makeStringBuilder();
+                                writeString(&!where, "/panel/");
+                                writeString(&!where, asSpan(&name));
+                                destroyString(name);
+                                let text: String := finalize(where);
+                                storageNote(asSpan(&text), error.code);
+                                destroyString(text);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when None do
+                        destroyString(name);
+                        return plain(404, "no such panel\n");
+                end case;
+        end case;
+    end;
+
+    -- roxie.db of the working directory, opened.  The open reads the schema
+    -- once and does not wait (Hilde's SQLCipher binding), so a store whose
+    -- WAL another connection is rebuilding answers SQLITE_BUSY_RECOVERY
+    -- (261) at once: five panels asked together met it.
+    -- A busy store is opened again every 10 ms, at most 500 times, as
+    -- Hilde's switch to WAL waits.
+    function openStore(): Either[DbError, Database[Writing]] is
+        var tries: Int32 := 0;
+        while true do
+            case openSqlite(database_path) of
+                when Right(right as opened: Database[Writing]) do
+                    return Right(right => opened);
+                when Left(left as error: DbError) do
+                    if (not isBusy(error)) or (tries >= 500) then
+                        return Left(left => error);
+                    end if;
+                    sleepFor(10);
+                    tries := tries + 1;
+            end case;
+        end while;
+    end;
+
+    -- Writes to standard output, the journal of roxie.service, why a page
+    -- answered 500: where, and the code of SQLite (the panels' 500s;
+    -- /ingest does the same since).
+    generic [W: Region]
+    function storageNote(where: Span[Nat8, W], code: Int32): Unit is
+        print("roxie: ");
+        print(where);
+        print(" could not be read: SQLite code ");
+        case toInt64(code) of
+            when Some(value as number: Int64) do
+                let digits: String := decimalText(number);
+                printLn(asSpan(&digits));
+                destroyString(digits);
+            when None do
+                printLn("?");
+        end case;
+        return nil;
+    end;
+
+    -- The same for a failure of Wolly.Dashboard.
+    generic [W: Region]
+    function dashboardNote(where: Span[Nat8, W], failure: DashboardFailure): Unit is
+        case failure of
+            when DashboardStorage(error as error: DbError) do
+                storageNote(where, error.code);
+            when UnfitPanels do
+                print("roxie: ");
+                print(where);
+                printLn(": the panels are not valid panels");
+        end case;
+        return nil;
+    end;
+
+    -- The same for a failure of Wolly.Auth.
+    generic [W: Region]
+    function authNote(where: Span[Nat8, W], failure: AuthError): Unit is
+        case failure of
+            when AuthStorage(error as error: DbError) do
+                storageNote(where, error.code);
+            when AuthCrypto do
+                print("roxie: ");
+                print(where);
+                printLn(": the random source, the digest or the password hash failed");
+            when AuthBadTime do
+                print("roxie: ");
+                print(where);
+                printLn(": a time below 0");
+        end case;
+        return nil;
+    end;
+
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The offset of a search page: 0 to 1000000, 0 for anything else.
+    generic [R: Region]
+    function offsetOf(request: &[Request, R]): Int64 is
+        let text: String := orEmpty(query(request, "offset"));
+        var offset: Int64 := 0;
+        if (spanLength(asSpan(&text)) > 0) and (spanLength(asSpan(&text)) <= 7) then
+            case parseInt(asSpan(&text)) of
+                when Some(value as parsed: Int64) do
+                    if (parsed >= 0) and (parsed <= 1000000) then
+                        offset := parsed;
+                    end if;
+                when None do
+                    skip;
+            end case;
+        end if;
+        destroyString(text);
+        return offset;
+    end;
+
+    -- The way to log in.  For a request of htmx (a panel asking for
+    -- itself after its session ended) HX-Redirect, so the whole page goes
+    -- there and not the form into the panel.
+    generic [R: Region]
+    function toLogin(request: &[Request, R]): String is
+        let asked: String := orEmpty(requestParam(request, requestVariable()));
+        let of_htmx: Bool := isHtmxRequest(asSpan(&asked));
+        destroyString(asked);
+        if of_htmx then
+            return finish(addHeader(guarded(200, "text/plain; charset=utf-8"), "HX-Redirect", "/login"), "see /login\n");
+        end if;
+        return redirect("/login");
+    end;
+
+    -- page for the user of the session of token, or the way to log in.
+    generic [R: Region, Q: Region, T: Region]
+    function sessionAnswer(db: &![Database[Writing], R], request: &[Request, Q], token: Span[Nat8, T], page: Page): String is
+        case sessionUser(&~db, token, now()) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as name: String) do
+                        destroyString(name);
+                        return pageFor(&~db, request, token, page);
+                    when None do
+                        return toLogin(request);
+                end case;
+            when Left(left as error: AuthError) do
+                authNote("the session of a page", error);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- page for the user of the request's session, or the way to log in.
+    function behindSession(request: Request, page: Page): String is
+        case sessionToken(&request) of
+            when None do
+                let output: String := toLogin(&request);
+                destroyRequest(request);
+                return output;
+            when Some(value as token: String) do
+                case openStore() of
+                    when Left(left as error: DbError) do
+                        storageNote("roxie.db, opened for a page", error.code);
+                        destroyString(token);
+                        destroyRequest(request);
+                        return plain(500, "internal server error\n");
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let output: String := sessionAnswer(&!db, &request, asSpan(&token), page);
+                        closeDatabase(db);
+                        destroyString(token);
+                        destroyRequest(request);
+                        return output;
+                end case;
+        end case;
+    end;
+
+    function home(request: Request): String is
+        return behindSession(request, Home());
+    end;
+
+    function search(request: Request): String is
+        return behindSession(request, Search());
+    end;
+
+    function showHelp(request: Request): String is
+        return behindSession(request, HelpPage());
+    end;
+
+    function panelPart(request: Request): String is
+        return behindSession(request, PanelPart());
+    end;
+
+    -- The script of htmx from the working directory (Standard.Htmx): 200
+    -- with a day of cache, 404 when the operator put none there.
+    function htmxScript(request: Request): String is
+        destroyRequest(request);
+        return scriptResponse(htmx_path);
+    end;
+
+    ---
+    --- Logging in and out
+    ---
+
+    ---
+    --- The sign-in through RAMBO
+    ---
+
+    -- rambo.conf and rambo-secret in the working directory: the settings
+    -- and the client secret (deploy/rambo-secret.sh puts it there).
+    constant rambo_conf_path: Span[Nat8, Static] := "rambo.conf";
+    constant rambo_secret_path: Span[Nat8, Static] := "rambo-secret";
+
+    -- text without the line end at its end.
+    generic [T: Region]
+    function withoutLineEnd(text: Span[Nat8, T]): Span[Nat8, T] is
+        var stop: Index := spanLength(text);
+        if stop > 0 then
+            if text[stop - 1] = 10 then
+                stop := stop - 1;
+            end if;
+        end if;
+        return substring(text, 0, stop);
+    end;
+
+    function signConfig(): Option[RamboConfig] is
+        case fileText(rambo_conf_path) of
+            when None do
+                return None();
+            when Some(value as text: String) do
+                case fileText(rambo_secret_path) of
+                    when None do
+                        destroyString(text);
+                        return None();
+                    when Some(value as secret: String) do
+                        let made: Option[RamboConfig] := readSignConfig(asSpan(&text), withoutLineEnd(asSpan(&secret)));
+                        destroyString(text);
+                        destroyString(secret);
+                        return made;
+                end case;
+        end case;
+    end;
+
+    -- Where RAMBO sends the browser after its logout: /signed-out of the
+    -- redirect of rambo.conf; /signed-out of this host when there is none.
+    function signedOutAddress(): String is
+        case fileText(rambo_conf_path) of
+            when None do
+                return fromSpan("/signed-out");
+            when Some(value as text: String) do
+                let found: Option[String] := signedOutUri(asSpan(&text));
+                destroyString(text);
+                case found of
+                    when Some(value as uri: String) do
+                        return uri;
+                    when None do
+                        return fromSpan("/signed-out");
+                end case;
+        end case;
+    end;
+
+    function signNotSet(): String is
+        return plain(503, "the sign-in through RAMBO is not set up\n");
+    end;
+
+    -- GET /login and GET /oauth/start: a sign-in begun, kept with the
+    -- session of the browser, and the browser sent to RAMBO.  The iss of
+    -- RAMBO's tile is not read: ROXIE knows one issuer, the one of
+    -- rambo.conf, and the ID token is checked against it.
+    function oauthStart(request: Request): String is
+        let old: String := orEmpty(sessionToken(&request));
+        destroyRequest(request);
+        case signConfig() of
+            when None do
+                destroyString(old);
+                return signNotSet();
+            when Some(value as config: RamboConfig) do
+                let answer: String := startWith(&config, asSpan(&old));
+                destroyRamboConfig(config);
+                destroyString(old);
+                return answer;
+        end case;
+    end;
+
+    generic [C: Region, T: Region]
+    function startWith(config: &[RamboConfig, C], old: Span[Nat8, T]): String is
+        case openStore() of
+            when Left(left as error: DbError) do
+                return plain(500, "internal server error\n");
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let answer: String := startIn(&!db, config, old);
+                closeDatabase(db);
+                return answer;
+        end case;
+    end;
+
+    generic [R: Region, C: Region, T: Region]
+    function startIn(db: &![Database[Writing], R], config: &[RamboConfig, C], old: Span[Nat8, T]): String is
+        case visitorSession(&~db, old, now()) of
+            when Left(left as error: AuthError) do
+                return plain(500, "internal server error\n");
+            when Right(right as token: String) do
+                case beginLogin(config, reauthSeconds(), false) of
+                    when None do
+                        destroyString(token);
+                        return plain(500, "internal server error\n");
+                    when Some(value as begun: RamboStart) do
+                        let kept: Either[DbError, Bool] := keepPending(&~db, asSpan(&token), &begun, now());
+                        let { url as url: String, state as state: String, nonce as nonce: String, verifier as verifier: String } := begun;
+                        destroyString(state);
+                        destroyString(nonce);
+                        destroyString(verifier);
+                        var done: Bool := false;
+                        case kept of
+                            when Right(right as put: Bool) do
+                                done := put;
+                            when Left(left as error: DbError) do
+                                skip;
+                        end case;
+                        if not done then
+                            destroyString(url);
+                            destroyString(token);
+                            return plain(500, "internal server error\n");
+                        end if;
+                        let response: Response := withSessionCookie(addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", asSpan(&url)), asSpan(&token));
+                        destroyString(url);
+                        destroyString(token);
+                        return finish(response, "to RAMBO\n");
+                end case;
+        end case;
+    end;
+
+    -- GET /oauth/callback: the sign-in of the session taken once, the code
+    -- redeemed, the ID token checked, and the account bound to a user
+    -- opens a session for it; any other account is 403.
+    function oauthCallback(request: Request): String is
+        let code: String := orEmpty(query(&request, "code"));
+        let state: String := orEmpty(query(&request, "state"));
+        let old: String := orEmpty(sessionToken(&request));
+        let address: String := client(&request);
+        destroyRequest(request);
+        case signConfig() of
+            when None do
+                destroyString(code);
+                destroyString(state);
+                destroyString(old);
+                destroyString(address);
+                return signNotSet();
+            when Some(value as config: RamboConfig) do
+                let answer: String := callbackWith(&config, asSpan(&code), asSpan(&state), asSpan(&old), asSpan(&address));
+                destroyRamboConfig(config);
+                destroyString(code);
+                destroyString(state);
+                destroyString(old);
+                destroyString(address);
+                return answer;
+        end case;
+    end;
+
+    generic [C: Region, D: Region, S: Region, T: Region, A: Region]
+    function callbackWith(config: &[RamboConfig, C], code: Span[Nat8, D], state: Span[Nat8, S], old: Span[Nat8, T],
+                          address: Span[Nat8, A]): String is
+        case openStore() of
+            when Left(left as error: DbError) do
+                return plain(500, "internal server error\n");
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let answer: String := callbackIn(&!db, config, code, state, old, address);
+                closeDatabase(db);
+                return answer;
+        end case;
+    end;
+
+    -- Writes to standard output, the journal of roxie.service (line by
+    -- line, stdbuf), why RAMBO gave no tokens: the kind, and the status,
+    -- error and description of an OAuth error or the sentence of a request
+    -- that failed.  Neither code, verifier nor secret is in the error.
+    function noteRamboError(error: RamboError): Unit is
+        case error of
+            when Unreachable(detail: String) do
+                print("roxie: RAMBO did not give the tokens: unreachable: ");
+                printLn(asSpan(&detail));
+                destroyString(detail);
+            when Refused(status: Nat16, code: String, description: String) do
+                print("roxie: RAMBO did not give the tokens: refused, status ");
+                print(status);
+                print(", error ");
+                print(asSpan(&code));
+                print(": ");
+                printLn(asSpan(&description));
+                destroyString(code);
+                destroyString(description);
+            when Malformed do
+                printLn("roxie: RAMBO did not give the tokens: malformed answer");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, C: Region, D: Region, S: Region, T: Region, A: Region]
+    function callbackIn(db: &![Database[Writing], R], config: &[RamboConfig, C], code: Span[Nat8, D], state: Span[Nat8, S],
+                        old: Span[Nat8, T], address: Span[Nat8, A]): String is
+        case takePending(&~db, old, state, now()) of
+            when Left(left as error: DbError) do
+                return plain(500, "internal server error\n");
+            when Right(right as found: Option[RamboPending]) do
+                case found of
+                    when None do
+                        return plain(400, "this sign-in is unknown here or older than ten minutes; begin again at /login\n");
+                    when Some(value as pending: RamboPending) do
+                        let { nonce as nonce: String, verifier as verifier: String } := pending;
+                        let got: Either[RamboError, RamboTokens] := exchangeCode(config, code, asSpan(&verifier));
+                        destroyString(verifier);
+                        case got of
+                            when Left(left as error: RamboError) do
+                                noteRamboError(error);
+                                destroyString(nonce);
+                                return plain(502, "RAMBO did not give the tokens; the journal of roxie says why\n");
+                            when Right(right as tokens: RamboTokens) do
+                                let { accessToken as access: String, idToken as id: String, refreshToken as refresh: String, expiresIn as expires: Int64 } := tokens;
+                                destroyString(access);
+                                destroyString(refresh);
+                                let answer: String := checkIn(&~db, config, asSpan(&id), asSpan(&nonce), old, address);
+                                destroyString(id);
+                                destroyString(nonce);
+                                return answer;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, C: Region, I: Region, N: Region, T: Region, A: Region]
+    function checkIn(db: &![Database[Writing], R], config: &[RamboConfig, C], id_token: Span[Nat8, I], nonce: Span[Nat8, N],
+                     old: Span[Nat8, T], address: Span[Nat8, A]): String is
+        case fetchJwks(config) of
+            when None do
+                return plain(502, "the keys of RAMBO could not be read\n");
+            when Some(value as jwks: String) do
+                case idTokenProblem(config, id_token, asSpan(&jwks), nonce, reauthSeconds(), now()) of
+                    when Some(value as reason: String) do
+                        destroyString(reason);
+                        destroyString(jwks);
+                        return plain(403, "the ID token of RAMBO does not hold\n");
+                    when None do
+                        let payload: Option[String] := verifiedPayload(id_token, asSpan(&jwks));
+                        destroyString(jwks);
+                        case payload of
+                            when None do
+                                return plain(403, "the ID token of RAMBO does not hold\n");
+                            when Some(value as text: String) do
+                                let sub: Option[String] := claimText(asSpan(&text), "sub");
+                                destroyString(text);
+                                case sub of
+                                    when None do
+                                        return plain(403, "the ID token of RAMBO names no account\n");
+                                    when Some(value as account: String) do
+                                        let answer: String := enterAs(&~db, asSpan(&account), id_token, old, address);
+                                        destroyString(account);
+                                        return answer;
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function notAllowed(): String is
+        return plain(403, "this account of RAMBO is not allowed here; the operator allows it with roxie allow\n");
+    end;
+
+    generic [R: Region, S: Region, I: Region, T: Region, A: Region]
+    function enterAs(db: &![Database[Writing], R], sub: Span[Nat8, S], id_token: Span[Nat8, I], old: Span[Nat8, T], address: Span[Nat8, A]): String is
+        case userOfSub(&~db, sub) of
+            when Left(left as error: DbError) do
+                return plain(500, "internal server error\n");
+            when Right(right as found: Option[String]) do
+                case found of
+                    when None do
+                        return notAllowed();
+                    when Some(value as name: String) do
+                        let opened: Either[AuthError, Option[String]] := externalLogin(&~db, old, asSpan(&name), audit_path, address, now());
+                        destroyString(name);
+                        case opened of
+                            when Left(left as error: AuthError) do
+                                return plain(500, "internal server error\n");
+                            when Right(right as session: Option[String]) do
+                                case session of
+                                    when None do
+                                        return notAllowed();
+                                    when Some(value as token: String) do
+                                        let kept: Bool := tableMade(keepIdToken(&~db, asSpan(&token), id_token, now()));
+                                        let response: Response := withSessionCookie(addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", "/"), asSpan(&token));
+                                        destroyString(token);
+                                        return finish(response, "see /\n");
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- GET /signed-out: where RAMBO sends the browser after its logout; no
+    -- session needed.
+    function signedOut(request: Request): String is
+        destroyRequest(request);
+        let response: Response := withoutSessionCookie(guarded(200, "text/plain; charset=utf-8"));
+        return finish(response, "Signed out of ROXIE. Sign in again at /login.\n");
+    end;
+
+    -- The ID token of the session of token, for the hint of RAMBO's logout;
+    -- empty when there is none.
+    generic [R: Region, T: Region]
+    function idTokenOf(db: &![Database[Writing], R], token: Span[Nat8, T]): String is
+        case takeIdToken(&~db, token) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as id: String) do
+                        return id;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when Left(left as error: DbError) do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The answer after ROXIE's logout: the page that posts the
+    -- ID token as hint to RAMBO's logout, coming back to /signed-out; a
+    -- redirect to /signed-out when the sign-in is not set up.  A POST, as
+    -- the token in a redirect made its address about 4 KB long, and the
+    -- web server in front answered 503 to it.
+    generic [H: Region]
+    function signOutAnswer(hint: Span[Nat8, H]): String is
+        case signConfig() of
+            when None do
+                let gone: Response := withoutSessionCookie(addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", "/signed-out"));
+                return finish(gone, "see /signed-out\n");
+            when Some(value as config: RamboConfig) do
+                let back: String := signedOutAddress();
+                let page: String := logoutForm(&config, hint, asSpan(&back), "");
+                let policy: String := logoutPolicy(&config);
+                destroyRamboConfig(config);
+                destroyString(back);
+                let cached: Response := addHeader(makeResponse(200, "text/html; charset=utf-8"), "Cache-Control", "no-store");
+                let response: Response := withoutSessionCookie(addHeader(cached, "Content-Security-Policy", asSpan(&policy)));
+                destroyString(policy);
+                let output: String := finish(response, asSpan(&page));
+                destroyString(page);
+                return output;
+        end case;
+    end;
+
+    -- roxie allow NAME SUB: the account SUB of RAMBO opens sessions of the
+    -- user NAME; the user is made when there is none, with a password of
+    -- 64 random hex digits that is never shown, for no form takes one.
+    generic [N: Region, S: Region]
+    function allowCommand(name: Span[Nat8, N], sub: Span[Nat8, S]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openStore() of
+            when Left(left as error: DbError) do
+                printLn("roxie: roxie.db could not be opened");
+                return ExitFailure();
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let made: Bool := userMade(&!db, name);
+                var bound: Bool := false;
+                if made then
+                    case bindSub(&!db, sub, name) of
+                        when Right(right as done: Bool) do
+                            bound := done;
+                        when Left(left as error: DbError) do
+                            skip;
+                    end case;
+                end if;
+                closeDatabase(db);
+                if bound then
+                    printLn("roxie: the account is allowed");
+                    return ExitSuccess();
+                end if;
+                printLn("roxie: refused: no user name, or no account of RAMBO (1 to 255 printable bytes)");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Whether the user name is there, made now when it was not.
+    generic [R: Region, N: Region]
+    function userMade(db: &![Database[Writing], R], name: Span[Nat8, N]): Bool is
+        case randomBytes(32) of
+            when None do
+                return false;
+            when Some(value as bytes: String) do
+                let password: String := bytesToHex(asSpan(&bytes));
+                destroyString(bytes);
+                let added: Either[AuthError, Bool] := addUser(&~db, name, asSpan(&password), known_passwords_path);
+                destroyString(password);
+                case added of
+                    when Left(left as error: AuthError) do
+                        return false;
+                    when Right(right as done: Bool) do
+                        if done then
+                            return true;
+                        end if;
+                        -- Refused: the name is taken, or no name.  Taken is
+                        -- what is wanted; no name bindSub refuses itself.
+                        return isUserName(name);
+                end case;
+        end case;
+    end;
+
+    -- roxie revoke-user NAME: no account of RAMBO opens sessions of NAME
+    -- any more.
+    generic [N: Region]
+    function revokeUserCommand(name: Span[Nat8, N]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openStore() of
+            when Left(left as error: DbError) do
+                printLn("roxie: roxie.db could not be opened");
+                return ExitFailure();
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let removed: Either[DbError, Nat64] := unbindUser(&!db, name);
+                closeDatabase(db);
+                case removed of
+                    when Right(right as count: Nat64) do
+                        print("roxie: accounts no more allowed: ");
+                        printLn(count);
+                        return ExitSuccess();
+                    when Left(left as error: DbError) do
+                        printLn("roxie: the accounts could not be taken out");
+                        return ExitFailure();
+                end case;
+        end case;
+    end;
+
+    function doLogout(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    let address: String := client(&request);
+                    destroyRequest(request);
+                    case openStore() of
+                        when Right(right as opened: Database[Writing]) do
+                            var db: Database[Writing] := opened;
+                            let hint: String := idTokenOf(&!db, asSpan(&token));
+                            let ended: Either[AuthError, Unit] := logout(&!db, asSpan(&token), asSpan(&address), now(), audit_path);
+                            closeDatabase(db);
+                            destroyString(token);
+                            destroyString(address);
+                            case ended of
+                                when Right(right as done: Unit) do
+                                    let output: String := signOutAnswer(asSpan(&hint));
+                                    destroyString(hint);
+                                    return output;
+                                when Left(left as error: AuthError) do
+                                    destroyString(hint);
+                                    return plain(500, "internal server error\n");
+                            end case;
+                        when Left(left as error: DbError) do
+                            destroyString(token);
+                            destroyString(address);
+                            return plain(500, "internal server error\n");
+                    end case;
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    ---
+    --- The second factor (Wolly.Totp, after Wolly's examples/login)
+    ---
+
+    ---
+    --- The collector
+    ---
+
+    function ingest(request: Request): String is
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let output: String := answerIngest(&!db, &request, now());
+                closeDatabase(db);
+                destroyRequest(request);
+                return output;
+            when Left(left as error: DbError) do
+                storageNote("roxie.db, opened for /ingest", error.code);
+                destroyRequest(request);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- GET /api/query: a reader's query with its token (Roxie.Reader).
+    function apiQuery(request: Request): String is
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let output: String := answerReader(&!db, &request, now(), versionNumber());
+                closeDatabase(db);
+                destroyRequest(request);
+                return output;
+            when Left(left as error: DbError) do
+                storageNote("roxie.db, opened for /api/query", error.code);
+                destroyRequest(request);
+                return plain(503, "storage\n");
+        end case;
+    end;
+
+    generic [R: Region, B: Region, A: Region]
+    function logged(request: Request, routes: &[Buffer[Route], R], befores: &[Buffer[Fn[Request, Step]], B],
+                    afters: &[Buffer[Fn[String, String]], A]): String is
+        case logToFile(access_path, Info(), JsonLines()) of
+            when Some(value as opened: Log) do
+                var log: Log := opened;
+                let output: String := dispatchLogged(request, routes, befores, afters, &!log);
+                let closed: Bool := closeLog(log);
+                return output;
+            when None do
+                return dispatchWith(request, routes, befores, afters);
+        end case;
+    end;
+
+    function handle(request: Request): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/", handler => home));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/search", handler => search));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/help", handler => showHelp));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/panel/:name", handler => panelPart));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/htmx.min.js", handler => htmxScript));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/login", handler => oauthStart));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/oauth/start", handler => oauthStart));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/oauth/callback", handler => oauthCallback));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/signed-out", handler => signedOut));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/logout", handler => doLogout));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/ingest", handler => ingest));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/api/query", handler => apiQuery));
+        var befores: Buffer[Fn[Request, Step]] := allocateEmpty();
+        insertBack(&!befores, knownMethods);
+        var afters: Buffer[Fn[String, String]] := allocateEmpty();
+        insertBack(&!afters, securityHeaders);
+        let output: String := logged(request, &routes, &befores, &afters);
+        destroyFree(routes);
+        destroyFree(befores);
+        destroyFree(afters);
+        return output;
+    end;
+
+    -- The keys and the tables, the keys made when there are none.
+    function tableMade(problem: Option[DbError]): Bool is
+        case problem of
+            when Some(value as error: DbError) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function prepare(): Bool is
+        case readKey(key_path) of
+            when Some(value as key: String) do
+                destroyString(key);
+            when None do
+                if not makeKey(key_path) then
+                    printLn("roxie: csrf.key is unfit and could not be made: mode 0600, 32 to 4096 bytes");
+                    return false;
+                end if;
+        end case;
+        case readKey(pseudonym_key_path) of
+            when Some(value as key: String) do
+                destroyString(key);
+            when None do
+                if not makeKey(pseudonym_key_path) then
+                    printLn("roxie: pseudonym.key is unfit and could not be made: mode 0600, 32 to 4096 bytes");
+                    return false;
+                end if;
+        end case;
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let auth: Either[AuthError, Unit] := prepareAuth(&!db);
+                let kept: Bool := prepareIngest(&!db);
+                --: the sign-ins of RAMBO and the accounts bound.
+                let rambo: Option[DbError] := prepareRambo(&!db);
+                let bound: Option[DbError] := prepareSign(&!db);
+                let sign_ready: Bool := tableMade(rambo) and tableMade(bound);
+                closeDatabase(db);
+                case auth of
+                    when Left(left as error: AuthError) do
+                        printLn("roxie: the tables of users and sessions could not be made");
+                        return false;
+                    when Right(right as done: Unit) do
+                        if not kept then
+                            printLn("roxie: the tables of lines, tokens and metrics could not be made");
+                        end if;
+                        if not sign_ready then
+                            printLn("roxie: the tables of the sign-in through RAMBO could not be made");
+                        end if;
+                        return kept and sign_ready;
+                end case;
+            when Left(left as error: DbError) do
+                printLn("roxie: roxie.db could not be opened");
+                return false;
+        end case;
+    end;
+
+    function collectorLimits(): Limits is
+        let base: Limits := defaultLimits();
+        return Limits(workers => base.workers, connections => base.connections, paramsBytes => base.paramsBytes,
+                      bodyBytes => mostBatchBytes(), requestMilliseconds => base.requestMilliseconds,
+                      writeMilliseconds => base.writeMilliseconds);
+    end;
+
+    -- Whether path may be the collector's socket: absolute, at most 100
+    -- bytes (a Unix socket address holds 108), no control byte.
+    generic [P: Region]
+    function isSocketPath(path: Span[Nat8, P]): Bool is
+        let size: Index := spanLength(path);
+        if (size < 2) or (size > 100) then
+            return false;
+        end if;
+        if path[0] /= '/' then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if (path[i] < 32) or (path[i] = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [S: Region]
+    function runServer(socket: Span[Nat8, S]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case serve(socket, handle, collectorLimits()) of
+            when Stopped(accepted: Index) do
+                print("roxie: stopped, connections accepted: ");
+                printLn(accepted);
+                return ExitSuccess();
+            when NoSocket do
+                print("roxie: the socket could not be made: ");
+                printLn(socket);
+                return ExitFailure();
+            when NotStarted do
+                printLn("roxie: the server did not start");
+                return ExitFailure();
+        end case;
+    end;
+
+    ---
+    --- Commands
+    ---
+
+    generic [N: Region]
+    function tokenCommand(name: Span[Nat8, N], revoke: Bool): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                if revoke then
+                    let revoked: Either[DbError, Bool] := revokeTokens(&!db, name);
+                    closeDatabase(db);
+                    case revoked of
+                        when Right(right as done: Bool) do
+                            if done then
+                                printLn("roxie: tokens revoked");
+                                return ExitSuccess();
+                            end if;
+                            printLn("roxie: refused: the host has no token");
+                            return ExitFailure();
+                        when Left(left as error: DbError) do
+                            printLn("roxie: the tokens could not be revoked");
+                            return ExitFailure();
+                    end case;
+                else
+                    let issued: Either[DbError, Option[String]] := issueToken(&!db, name, now());
+                    closeDatabase(db);
+                    case issued of
+                        when Right(right as given: Option[String]) do
+                            case given of
+                                when Some(value as token: String) do
+                                    printLn(asSpan(&token));
+                                    destroyString(token);
+                                    return ExitSuccess();
+                                when None do
+                                    printLn("roxie: refused: the host is no name (1 to 64 bytes of a to z, 0 to 9, dot, hyphen)");
+                                    return ExitFailure();
+                            end case;
+                        when Left(left as error: DbError) do
+                            printLn("roxie: the token could not be stored");
+                            return ExitFailure();
+                    end case;
+                end if;
+            when Left(left as error: DbError) do
+                printLn("roxie: roxie.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- roxie reader NAME and roxie revoke-reader NAME: the tokens of
+    -- _reader.NAME (Roxie.Reader).
+    generic [N: Region]
+    function readerCommand(name: Span[Nat8, N], revoke: Bool): ExitCode is
+        case readerOwner(name) of
+            when Some(value as owner: String) do
+                let code: ExitCode := tokenCommand(asSpan(&owner), revoke);
+                destroyString(owner);
+                return code;
+            when None do
+                printLn("roxie: refused: the reader is no name (1 to 56 bytes of a to z, 0 to 9, hyphen)");
+                return ExitFailure();
+        end case;
+    end;
+
+    ---
+    --- The agent
+    ---
+
+    generic [P: Region]
+    function fileText(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case text of
+                    when Some(value as content: String) do
+                        if spanLength(asSpan(&content)) > config_most then
+                            destroyString(content);
+                            return None();
+                        else
+                            return Some(value => content);
+                        end if;
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The digits of a count, none below 0 (a count is never below 0).
+    generic [B: Region]
+    function writeCount(out: &![StringBuilder, B], count: Int64): Unit is
+        if count >= 10 then
+            writeCount(&~out, count / 10);
+        end if;
+        if count >= 0 then
+            let digit: Int64 := count - ((count / 10) * 10);
+            case toNat8(digit + 48) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&~out, byte);
+                when None do
+                    skip;
+            end case;
+        end if;
+        return nil;
+    end;
+
+    -- What the agent says goes to the standard error, a line at once:
+    -- stdio buffers the standard output fully when it is a pipe, as to
+    -- syslog under rc.d on edge, and a line of a round would
+    -- wait there until the agent ends.
+    generic [Q: Region, T: Region]
+    function agentSays(power: &![RootCapability, Q], text: Span[Nat8, T]): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "roxie agent: ");
+        writeString(&!out, text);
+        writeByte(&!out, 10);
+        let line: String := finalize(out);
+        toError(&~power, asSpan(&line));
+        destroyString(line);
+        return nil;
+    end;
+
+    -- The line of the rounds in tally, report being the last of them:
+    -- lines, batches taken and set aside, whether the last kept a batch
+    -- back, and how many rounds when more than one.
+    generic [Q: Region]
+    function sayTally(power: &![RootCapability, Q], tally: Tally, report: RoundReport): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "lines ");
+        writeCount(&!out, tally.collected);
+        writeString(&!out, ", batches taken ");
+        writeCount(&!out, tally.taken);
+        writeString(&!out, ", set aside ");
+        writeCount(&!out, tally.setAside);
+        if report.keptBack then
+            writeString(&!out, ", kept back at status ");
+            case toInt64(report.status) of
+                when Some(value as status: Int64) do
+                    writeCount(&!out, status);
+                when None do
+                    skip;
+            end case;
+        end if;
+        if tally.rounds > 1 then
+            writeString(&!out, ", in ");
+            writeCount(&!out, tally.rounds);
+            writeString(&!out, " rounds");
+        end if;
+        let line: String := finalize(out);
+        agentSays(&~power, asSpan(&line));
+        destroyString(line);
+        return nil;
+    end;
+
+    generic [Q: Region]
+    function sayUnreadable(power: &![RootCapability, Q], report: RoundReport): Unit is
+        if report.unreadable > 0 then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, "files not read: ");
+            writeCount(&!out, report.unreadable);
+            let line: String := finalize(out);
+            agentSays(&~power, asSpan(&line));
+            destroyString(line);
+        end if;
+        return nil;
+    end;
+
+    -- The line of one round, for agent-once: said when the round moved anything.
+    generic [Q: Region]
+    function sayRound(power: &![RootCapability, Q], report: RoundReport): Unit is
+        if movedAnything(report) then
+            sayTally(&~power, counted(freshTally(0), report), report);
+        end if;
+        sayUnreadable(&~power, report);
+        return nil;
+    end;
+
+    -- Rounds of config with token in the state db until a signal ends
+    -- them, or one; nothing when the tables are not ready.
+    generic [Q: Region, R: Region, C: Region, T: Region, Z: Region]
+    function roundsWith(power: &![RootCapability, Q], db: &![Database[Writing], R], config: &[AgentConfig, C],
+                        token: Span[Nat8, T], zone: &[Zone, Z], once: Bool, ready: Bool): ExitCode is
+        if not ready then
+            agentSays(&~power, "the tables of the state could not be made");
+            return ExitFailure();
+        end if;
+        if once then
+            let report: RoundReport := round(&~db, config, token, zone, now());
+            sayRound(&~power, report);
+            if report.keptBack or (report.unreadable > 0) then
+                return ExitFailure();
+            end if;
+            return ExitSuccess();
+        end if;
+        case watchSignals(Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false)) of
+            when None do
+                agentSays(&~power, "the signals could not be watched");
+                return ExitFailure();
+            when Some(value as watched: Signals) do
+                var signals: Signals := watched;
+                var going: Bool := true;
+                let pause: Nat32 := waitOf(config->every);
+                -- Rounds that went well are said together every report
+                -- seconds, the first at once (Roxie.Agent.dueAt).
+                var tally: Tally := freshTally(0);
+                while going do
+                    let at: Int64 := now();
+                    let report: RoundReport := round(&~db, config, token, zone, at);
+                    if movedAnything(report) then
+                        tally := counted(tally, report);
+                    end if;
+                    if dueAt(tally, report, at, config->report) then
+                        sayTally(&~power, tally, report);
+                        tally := freshTally(at);
+                    end if;
+                    sayUnreadable(&~power, report);
+                    let woken: Bool := waitSignal(&!signals, pause);
+                    if shutdownRequested(&!signals) then
+                        going := false;
+                    end if;
+                end while;
+                let stopped: Bool := stopWatching(signals);
+                agentSays(&~power, "stopped");
+                return ExitSuccess();
+        end case;
+    end;
+
+    generic [Q: Region, C: Region, T: Region, Z: Region]
+    function rounds(power: &![RootCapability, Q], config: &[AgentConfig, C], token: Span[Nat8, T], zone: &[Zone, Z], once: Bool): ExitCode is
+        case openSqlite(asSpan(&(config->state))) of
+            when Left(left as error: DbError) do
+                agentSays(&~power, "the state could not be opened");
+                return ExitFailure();
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                -- A new state numbers its batches above the time in milliseconds, above
+                -- any state of this host before it (Roxie.Outbox.startNumbersAt).
+                let tables: Bool := prepareOutbox(&!db);
+                let started: Bool := startNumbersAt(&!db, now() * 1000);
+                let ready: Bool := tables and started;
+                let code: ExitCode := roundsWith(&~power, &!db, config, token, zone, once, ready);
+                closeDatabase(db);
+                return code;
+        end case;
+    end;
+
+    function waitOf(seconds: Int64): Nat32 is
+        case toNat32(seconds * 1000) of
+            when Some(value as millis: Nat32) do
+                return millis;
+            when None do
+                return 10000;
+        end case;
+    end;
+
+    -- The zone of this host for the lines of the BSD form, read
+    -- before the agent is confined: TZ, else /etc/localtime.  UTC, said
+    -- once, when neither is read.
+    generic [Q: Region]
+    function hostZone(power: &![RootCapability, Q]): Zone is
+        case localZone() of
+            when Right(right as zone: Zone) do
+                return zone;
+            when Left(left as why: ZoneFailure) do
+                agentSays(&~power, "the zone of this host could not be read, lines of the BSD form are read in UTC");
+                return utcZone();
+        end case;
+    end;
+
+    generic [Q: Region, C: Region]
+    function agentWith(power: &![RootCapability, Q], config: &[AgentConfig, C], once: Bool): ExitCode is
+        case readToken(asSpan(&(config->token))) of
+            when None do
+                agentSays(&~power, "the token could not be read: 64 hex digits in a file of mode 0600");
+                return ExitFailure();
+            when Some(value as token: String) do
+                -- Confined before the state is opened, once the
+                -- configuration and the token are read: an agent
+                -- nothing confines does not run.  The rounds of agent-once
+                -- say nothing when nothing is new, so only the agent that
+                -- keeps running names what confines it.
+                let zone: Zone := hostZone(&~power);
+                let report: Report := applyPolicy(agentPolicy(config));
+                if not once then
+                    let line: String := describeReport(report);
+                    agentSays(&~power, asSpan(&line));
+                    destroyString(line);
+                end if;
+                if not reportApplied(report) then
+                    destroyString(token);
+                    destroyZone(zone);
+                    agentSays(&~power, "nothing confines the agent, so it does not run");
+                    return ExitFailure();
+                end if;
+                let code: ExitCode := rounds(&~power, config, asSpan(&token), &zone, once);
+                destroyString(token);
+                destroyZone(zone);
+                return code;
+        end case;
+    end;
+
+    generic [Q: Region, P: Region]
+    function agentCommand(power: &![RootCapability, Q], path: Span[Nat8, P], once: Bool): ExitCode is
+        case fileText(path) of
+            when None do
+                agentSays(&~power, "the configuration could not be read");
+                return ExitFailure();
+            when Some(value as text: String) do
+                let read: Either[ConfigError, AgentConfig] := readConfig(asSpan(&text));
+                destroyString(text);
+                case read of
+                    when Left(left as error: ConfigError) do
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, "the configuration is refused at line ");
+                        case toInt64(error.line) of
+                            when Some(value as number: Int64) do
+                                writeCount(&!out, number);
+                            when None do
+                                skip;
+                        end case;
+                        writeString(&!out, ": ");
+                        writeString(&!out, configProblemName(error.problem));
+                        let line: String := finalize(out);
+                        agentSays(&~power, asSpan(&line));
+                        destroyString(line);
+                        return ExitFailure();
+                    when Right(right as config: AgentConfig) do
+                        let code: ExitCode := agentWith(&~power, &config, once);
+                        destroyConfig(config);
+                        return code;
+                end case;
+        end case;
+    end;
+
+    -- The lines of audit.log older than Wolly.AuditLog keeps them (365
+    -- days), taken out under a writing transaction, as Wolly.Auth writes
+    -- each line under one, so none written meanwhile is lost.
+    -- None when the transaction or the rewrite failed.
+    generic [R: Region]
+    function pruneAudit(db: &![Database[Writing], R]): Option[Int64] is
+        case begin(&~db) of
+            when Right(right as transaction: Transaction) do
+                let removed: Option[Int64] := pruneAuditLog(audit_path, now());
+                case commit(&~db, transaction) of
+                    when Right(right as done: Unit) do
+                        return removed;
+                    when Left(left as error: DbError) do
+                        return removed;
+                end case;
+            when Left(left as error: DbError) do
+                return None();
+        end case;
+    end;
+
+    -- Takes the lines and samples older than days days out of the store.
+    generic [D: Region]
+    function pruneCommand(days: Span[Nat8, D]): ExitCode is
+        var count: Int64 := 0;
+        if (spanLength(days) > 0) and (spanLength(days) <= 5) then
+            case parseInt(days) of
+                when Some(value as parsed: Int64) do
+                    count := parsed;
+                when None do
+                    skip;
+            end case;
+        end if;
+        if (count < 1) or (count > 36500) then
+            printLn("roxie: refused: DAYS is a number from 1 to 36500");
+            return ExitFailure();
+        end if;
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let report: PruneReport := pruneBefore(&!db, now() - (count * 86400));
+                let audit: Option[Int64] := pruneAudit(&!db);
+                closeDatabase(db);
+                print("roxie: lines pruned ");
+                print(report.lines);
+                print(", samples pruned ");
+                print(report.samples);
+                case audit of
+                    when Some(value as removed: Int64) do
+                        print(", audit lines pruned ");
+                        printLn(removed);
+                    when None do
+                        printLn("");
+                        printLn("roxie: audit.log was not pruned; run it again");
+                        return ExitFailure();
+                end case;
+                if not report.whole then
+                    printLn("roxie: the prune did not go through; run it again");
+                    return ExitFailure();
+                end if;
+                return ExitSuccess();
+            when Left(left as error: DbError) do
+                printLn("roxie: roxie.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- roxie relevel: every kept line the level Roxie.Line finds in it now
+    --; once after an update that changes the levels, and again
+    -- without harm.
+    -- The steps of relevel with a pause between them: each step
+    -- reads 1000 lines without the write lock and writes at most 10 a
+    -- transaction, then the collector has 200 ms to take the lock.  A line
+    -- a step tells how far it is; TERM or INT ends it between two steps,
+    -- and a run again goes over every line, again without harm.
+    generic [R: Region]
+    function relevelSteps(db: &![Database[Writing], R]): ExitCode is
+        case watchSignals(Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false)) of
+            when None do
+                printLn("roxie relevel: the signals could not be watched");
+                return ExitFailure();
+            when Some(value as watched: Signals) do
+                var signals: Signals := watched;
+                var after: Int64 := 0;
+                var seen: Int64 := 0;
+                var changed: Int64 := 0;
+                var going: Bool := true;
+                var whole: Bool := true;
+                var stopped: Bool := false;
+                while going do
+                    let part: RelevelPart := relevelAfter(&~db, after);
+                    seen := seen + part.seen;
+                    changed := changed + part.changed;
+                    if not part.whole then
+                        whole := false;
+                        going := false;
+                    else
+                        if part.seen = 0 then
+                            going := false;
+                        else
+                            after := part.last;
+                            print("roxie relevel: lines read ");
+                            print(seen);
+                            print(", level changed ");
+                            printLn(changed);
+                            let woken: Bool := waitSignal(&!signals, relevel_pause);
+                            if shutdownRequested(&!signals) then
+                                stopped := true;
+                                going := false;
+                            end if;
+                        end if;
+                    end if;
+                end while;
+                let unwatched: Bool := stopWatching(signals);
+                print("roxie: lines read ");
+                print(seen);
+                print(", level changed ");
+                printLn(changed);
+                if not whole then
+                    printLn("roxie: the relevel did not go through; run it again");
+                    return ExitFailure();
+                end if;
+                if stopped then
+                    printLn("roxie: the relevel stopped on a signal; run it again to go over every line");
+                end if;
+                return ExitSuccess();
+        end case;
+    end;
+
+    function relevelCommand(): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let code: ExitCode := relevelSteps(&!db);
+                closeDatabase(db);
+                return code;
+            when Left(left as error: DbError) do
+                printLn("roxie: roxie.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    ---
+    --- The command line
+    ---
+
+    constant notice: Span[Nat8, Static] := "2026 Heiko Zimmermann";
+    constant manual_date: Span[Nat8, Static] := "October 22, 2026";
+    constant banner: Span[Nat8, Static] := " ####   ###  #   # ##### #####\n #   # #   #  # #    #   #\n ####  #   #   #     #   ####\n #  #  #   #  # #    #   #\n #   #  ###  #   # ##### #####\n";
+
+    -- The keys of what roxie declares.
+    record Keys: Free is
+        verbose: FlagKey;
+        json: FlagKey;
+        sandbox: FlagKey;
+        socket: PathKey;
+        serveWord: SubcommandKey;
+        serveSocket: PositionalKey;
+        agentWord: SubcommandKey;
+        agentConfig: PositionalKey;
+        onceWord: SubcommandKey;
+        onceConfig: PositionalKey;
+        tokenWord: SubcommandKey;
+        tokenHost: PositionalKey;
+        revokeWord: SubcommandKey;
+        revokeHost: PositionalKey;
+        readerWord: SubcommandKey;
+        readerName: PositionalKey;
+        revokeReaderWord: SubcommandKey;
+        revokeReaderName: PositionalKey;
+        allowWord: SubcommandKey;
+        allowName: PositionalKey;
+        allowSub: PositionalKey;
+        revokeUserWord: SubcommandKey;
+        revokeUserName: PositionalKey;
+        pruneWord: SubcommandKey;
+        pruneDays: PositionalKey;
+        relevelWord: SubcommandKey;
+        queryWord: SubcommandKey;
+        queryText: PositionalKey;
+        queryLimit: WholeKey;
+        querySince: TextKey;
+        doctorWord: SubcommandKey;
+    end;
+
+    record Declared: Linear is
+        root: Command;
+        keys: Keys;
+    end;
+
+    -- A subcommand with one positional argument.
+    generic [R: Region]
+    function withOne(root: &![Command, R], name: Span[Nat8, Static], about: Span[Nat8, Static], argument: Span[Nat8, Static],
+                     help: Span[Nat8, Static], needed: Bool): OneKeys is
+        var sub: Command := makeCommand(name, about);
+        let value: PositionalKey := addPositional(&!sub, argument, help, needed, false);
+        let word: SubcommandKey := addSubcommand(&~root, sub);
+        return OneKeys(word => word, value => value);
+    end;
+
+    record OneKeys: Free is
+        word: SubcommandKey;
+        value: PositionalKey;
+    end;
+
+    function declared(): Declared is
+        var root: Command := makeCommand("roxie", "ROXIE, the Ranked Objects eXtended Index Engine: the collector of the logs of a handful of hosts, and its agent.");
+        setVersion(&!root, versionNumber());
+        setCopyright(&!root, notice);
+        setFullVersion(&!root, fullVersion(versionNumber(), notice));
+        setInfo(&!root, info(banner, "Ranked Objects eXtended Index Engine", "roxie", versionNumber(), ""));
+        let verbose: FlagKey := addVerbose(&!root, "Say more: roxie query says how many lines it found in all.");
+        let json: FlagKey := addJson(&!root);
+        let sandbox: FlagKey := addSandbox(&!root);
+        let socket: PathKey := addSocket(&!root);
+        addCompletion(&!root);
+        addManual(&!root, manual_date);
+        let serve_keys: OneKeys := withOne(&!root, "serve", "The collector, a FastCGI responder on SOCKET, or without it on the socket of --socket, ROXIE_SOCKET or /run/roxie/roxie.sock.",
+                                          "SOCKET", "An absolute path of at most 100 bytes.", false);
+        let agent_keys: OneKeys := withOne(&!root, "agent", "The agent: a round every few seconds until SIGTERM.", "CONFIG", "The agent's configuration.", true);
+        let once_keys: OneKeys := withOne(&!root, "agent-once", "One round of the agent.", "CONFIG", "The agent's configuration.", true);
+        let token_keys: OneKeys := withOne(&!root, "token", "A token for the agent of HOST, shown once.", "HOST", "The host name of the agent.", true);
+        let revoke_keys: OneKeys := withOne(&!root, "revoke", "Revokes the tokens of HOST.", "HOST", "The host name of the agent.", true);
+        let reader_keys: OneKeys := withOne(&!root, "reader", "A token for the reader NAME, which may query and nothing else, shown once.",
+                                           "NAME", "1 to 56 bytes of a to z, 0 to 9 and hyphen.", true);
+        let revoke_reader_keys: OneKeys := withOne(&!root, "revoke-reader", "Revokes the tokens of the reader NAME.", "NAME", "The name of the reader.", true);
+        var allow_command_line: Command := makeCommand("allow", "The account SUB of RAMBO signs in as the user NAME.");
+        let allow_name: PositionalKey := addPositional(&!allow_command_line, "NAME", "The user of the pages.", true, false);
+        let allow_sub: PositionalKey := addPositional(&!allow_command_line, "SUB", "The account at RAMBO, its sub.", true, false);
+        let allow_word: SubcommandKey := addSubcommand(&!root, allow_command_line);
+        let revoke_user_keys: OneKeys := withOne(&!root, "revoke-user", "No account of RAMBO signs in as NAME any more.", "NAME", "The user of the pages.", true);
+        let prune_keys: OneKeys := withOne(&!root, "prune", "Takes lines and samples older than DAYS days out of the store.", "DAYS", "1 to 36500.", true);
+        var relevel_command_line: Command := makeCommand("relevel", "Gives every line the level of its text again.");
+        let relevel_word: SubcommandKey := addSubcommand(&!root, relevel_command_line);
+        var query_command_line: Command := makeCommand("query", "The lines QUERY finds in the store of the working directory, newest first (docs/syntax.md).");
+        let query_text: PositionalKey := addPositional(&!query_command_line, "QUERY", "A query of docs/syntax.md; its words are joined by spaces.", true, true);
+        let query_limit: WholeKey := addWhole(&!query_command_line, option("limit", 'n', "At most this many lines, 1 to 100."), 1, 100, "20");
+        let query_since: TextKey := addText(&!query_command_line, option("since", 0, "Only lines since: N and s, m, h, d or w, a day YYYY-MM-DD, or seconds."), "");
+        let query_word: SubcommandKey := addSubcommand(&!root, query_command_line);
+        var doctor_command_line: Command := makeCommand("doctor", "Checks the files of the collector in the working directory and its socket, and says how to set right what is missing.");
+        let doctor_word: SubcommandKey := addSubcommand(&!root, doctor_command_line);
+        let keys: Keys := Keys(verbose => verbose, json => json, sandbox => sandbox, socket => socket,
+                               serveWord => serve_keys.word, serveSocket => serve_keys.value,
+                               agentWord => agent_keys.word, agentConfig => agent_keys.value,
+                               onceWord => once_keys.word, onceConfig => once_keys.value,
+                               tokenWord => token_keys.word, tokenHost => token_keys.value,
+                               revokeWord => revoke_keys.word, revokeHost => revoke_keys.value,
+                               readerWord => reader_keys.word, readerName => reader_keys.value,
+                               revokeReaderWord => revoke_reader_keys.word, revokeReaderName => revoke_reader_keys.value,
+                               allowWord => allow_word, allowName => allow_name, allowSub => allow_sub,
+                               revokeUserWord => revoke_user_keys.word, revokeUserName => revoke_user_keys.value,
+                               pruneWord => prune_keys.word, pruneDays => prune_keys.value,
+                               relevelWord => relevel_word,
+                               queryWord => query_word, queryText => query_text, queryLimit => query_limit, querySince => query_since,
+                               doctorWord => doctor_word);
+        return Declared(root => root, keys => keys);
+    end;
+
+    -- text to the standard error, nothing for none.
+    generic [R: Region, T: Region]
+    function toError(power: &![RootCapability, R], text: Span[Nat8, T]): Unit is
+        if spanLength(text) = 0 then
+            return nil;
+        end if;
+        var terminal: TerminalCapability := acquireTerminal(&~power);
+        var stream: StandardError := acquireError(&!terminal);
+        let wrote: Bool := writeErrorText(&!stream, text);
+        releaseError(stream);
+        releaseTerminal(terminal);
+        return nil;
+    end;
+
+    -- The socket of the collector: --socket, ROXIE_SOCKET or the one of
+    -- Standard.Paths, /run/roxie/roxie.sock on Linux.
+    generic [R: Region]
+    function socketOf(m: &[Matches, R], keys: Keys): Option[String] is
+        case pathOf(m, keys.socket) of
+            when Some(value as given: &[String, R]) do
+                let none: Option[Span[Nat8, Static]] := None();
+                return choosePath("roxie", Service(), SocketFile(), Some(value => asSpan(given)), none);
+            when None do
+                let no_flag: Option[Span[Nat8, Static]] := None();
+                let none: Option[Span[Nat8, Static]] := None();
+                return choosePath("roxie", Service(), SocketFile(), no_flag, none);
+        end case;
+    end;
+
+    generic [P: Region, R: Region]
+    function serveOn(power: &![RootCapability, P], path: Span[Nat8, R]): ExitCode is
+        if not isSocketPath(path) then
+            toError(&~power, "roxie: refused: SOCKET is an absolute path of at most 100 bytes\n");
+            return ExitFailure();
+        end if;
+        return runServer(path);
+    end;
+
+    -- The words of QUERY joined by spaces.
+    generic [R: Region]
+    function queryOf(m: &[Matches, R], keys: Keys): String is
+        var out: StringBuilder := makeStringBuilder();
+        let count: Index := positionalCount(m, keys.queryText);
+        var i: Index := 0;
+        while i < count do
+            case positionalAt(m, keys.queryText, i) of
+                when Some(value as word: &[String, R]) do
+                    if i > 0 then
+                        writeString(&!out, " ");
+                    end if;
+                    writeString(&!out, asSpan(word));
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The answer of Roxie.Find in db, which is closed after it.
+    generic [Q: Region, S: Region]
+    function queryIn(db: Database[Writing], text: Span[Nat8, Q], since: Span[Nat8, S], seconds: Int64, limit: Int64, json: Bool,
+                     verbose: Bool): Answer is
+        var store: Database[Writing] := db;
+        let answer: Answer := answerQuery(&!store, text, since, seconds, limit, json, verbose, versionNumber());
+        closeDatabase(store);
+        return answer;
+    end;
+
+    -- roxie query: the answer of Roxie.Find, its status the exit status.
+    generic [P: Region, R: Region]
+    function queryCommand(power: &![RootCapability, P], m: &[Matches, R], keys: Keys): ExitCode is
+        let json: Bool := flagCount(m, keys.json) > 0;
+        let verbose: Bool := flagCount(m, keys.verbose) > 0;
+        var limit: Int64 := defaultShown();
+        case wholeOf(m, keys.queryLimit) of
+            when Some(value as given: Int64) do
+                limit := given;
+            when None do
+                skip;
+        end case;
+        let text: String := queryOf(m, keys);
+        var since: String := fromSpan("");
+        case textOf(m, keys.querySince) of
+            when Some(value as given: &[String, R]) do
+                destroyString(since);
+                since := fromSpan(asSpan(given));
+            when None do
+                skip;
+        end case;
+        let seconds: Int64 := now();
+        var status: Int32 := 4;
+        case openStore() of
+            when Right(right as opened: Database[Writing]) do
+                let { status as s: Int32, out as out: String, err as err: String } := queryIn(opened, asSpan(&text), asSpan(&since), seconds, limit,
+                                                                                              json, verbose);
+                print(asSpan(&out));
+                toError(&~power, asSpan(&err));
+                destroyString(out);
+                destroyString(err);
+                status := s;
+            when Left(left as error: DbError) do
+                let { status as s: Int32, out as out: String, err as err: String } := storageAnswer(asSpan(&text), json, versionNumber());
+                print(asSpan(&out));
+                toError(&~power, asSpan(&err));
+                destroyString(out);
+                destroyString(err);
+                status := s;
+        end case;
+        destroyString(text);
+        destroyString(since);
+        return exitWith(status);
+    end;
+
+    -- The exit of the status of an answer: 0 when the query ran,
+    -- whether it found lines (status 0) or none (1); 2 for a refused query
+    -- or --since, 3 for too many lines in the window, 4 for the store.  A
+    -- wrong command line stays 1 (Standard.Arguments).
+    function exitWith(status: Int32): ExitCode is
+        if status <= 1 then
+            return ExitSuccess();
+        end if;
+        if status = 2 then
+            return ExitStatus(status => (2 : Nat8));
+        end if;
+        if status = 3 then
+            return ExitStatus(status => (3 : Nat8));
+        end if;
+        return ExitStatus(status => (4 : Nat8));
+    end;
+
+    -- What roxie -s says: what confines the process as it runs.  The
+    -- agent applies the policy of Roxie.Confine once its configuration is
+    -- read; the other commands apply none themselves, and the
+    -- units of systemd confine them on server.
+    function sandboxText(): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "sandbox:     the agent confines itself once its configuration is read; the other commands by the units of systemd (deploy/*.service)\n");
+        writeString(&!out, "no new privs: ");
+        writeString(&!out, stateWord(queryNoNewPrivileges()));
+        writeString(&!out, "\nseccomp:     ");
+        writeString(&!out, stateWord(querySeccomp()));
+        writeString(&!out, "\n");
+        return finalize(out);
+    end;
+
+    function stateWord(state: Option[Bool]): Span[Nat8, Static] is
+        case state of
+            when Some(value as on: Bool) do
+                if on then
+                    return "yes";
+                end if;
+                return "no";
+            when None do
+                return "unknown on this system";
+        end case;
+    end;
+
+    generic [P: Region, R: Region, C: Region]
+    function dispatch(power: &![RootCapability, P], root: &[Command, C], m: &[Matches, R], keys: Keys): ExitCode is
+        if flagCount(m, keys.sandbox) > 0 then
+            let text: String := sandboxText();
+            print(asSpan(&text));
+            destroyString(text);
+            return ExitSuccess();
+        end if;
+        if chosen(m, keys.queryWord) then
+            return queryCommand(&~power, m, keys);
+        end if;
+        if chosen(m, keys.doctorWord) then
+            return doctorCommand(m, keys);
+        end if;
+        if chosen(m, keys.relevelWord) then
+            return relevelCommand();
+        end if;
+        if chosen(m, keys.serveWord) then
+            case positionalOf(m, keys.serveSocket) of
+                when Some(value as path: &[String, R]) do
+                    return serveOn(&~power, asSpan(path));
+                when None do
+                    skip;
+            end case;
+        end if;
+        case positionalOf(m, keys.agentConfig) of
+            when Some(value as path: &[String, R]) do
+                return agentCommand(&~power, asSpan(path), false);
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.onceConfig) of
+            when Some(value as path: &[String, R]) do
+                return agentCommand(&~power, asSpan(path), true);
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.tokenHost) of
+            when Some(value as host: &[String, R]) do
+                -- An agent's token is a host's; a name with an underscore is
+                -- a reader's and comes from roxie reader alone.
+                if not validHostname(asSpan(host)) then
+                    printLn("roxie: refused: the host is no host name (Wolly.Net.validHostname)");
+                    return ExitFailure();
+                end if;
+                return tokenCommand(asSpan(host), false);
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.readerName) of
+            when Some(value as name: &[String, R]) do
+                return readerCommand(asSpan(name), false);
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.revokeReaderName) of
+            when Some(value as name: &[String, R]) do
+                return readerCommand(asSpan(name), true);
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.revokeHost) of
+            when Some(value as host: &[String, R]) do
+                return tokenCommand(asSpan(host), true);
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.revokeUserName) of
+            when Some(value as name: &[String, R]) do
+                return revokeUserCommand(asSpan(name));
+            when None do
+                skip;
+        end case;
+        case positionalOf(m, keys.pruneDays) of
+            when Some(value as days: &[String, R]) do
+                return pruneCommand(asSpan(days));
+            when None do
+                skip;
+        end case;
+        if chosen(m, keys.allowWord) then
+            case positionalOf(m, keys.allowName) of
+                when Some(value as name: &[String, R]) do
+                    case positionalOf(m, keys.allowSub) of
+                        when Some(value as sub: &[String, R]) do
+                            return allowCommand(asSpan(name), asSpan(sub));
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+        end if;
+        case socketOf(m, keys) of
+            when Some(value as path: String) do
+                let code: ExitCode := serveOn(&~power, asSpan(&path));
+                destroyString(path);
+                return code;
+            when None do
+                toError(&~power, "roxie: no socket: give one with --socket or ROXIE_SOCKET\n");
+                return ExitFailure();
+        end case;
+    end;
+
+    generic [R: Region]
+    function command(power: &![RootCapability, R]): ExitCode is
+        let { root as root: Command, keys as keys: Keys } := declared();
+        let words: Buffer[String] := processArguments();
+        var code: ExitCode := ExitFailure();
+        case parse(&root, &words) of
+            when Right(right as outcome: ArgumentOutcome) do
+                case outcome of
+                    when Run(matches as m: Matches) do
+                        code := dispatch(&~power, &root, &m, keys);
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                        code := ExitSuccess();
+                    when Version(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                        code := ExitSuccess();
+                end case;
+            when Left(left as error: ArgumentError) do
+                let message: String := describeError(&root, &error);
+                toError(&~power, asSpan(&message));
+                destroyString(message);
+                destroyError(error);
+                code := ExitFailure();
+        end case;
+        destroyArguments(words);
+        destroyCommand(root);
+        return code;
+    end;
+
+    -- One check of roxie doctor: a regular file at path; with secret also
+    -- that nobody but its owner reads it (mode 0600 or 0400).
+    generic [R: Region]
+    function fileCheck(checkup: &![Checkup, R], name: Span[Nat8, Static], path: Span[Nat8, Static], secret: Bool,
+                       fix: Span[Nat8, Static]): Unit is
+        case statusOf(path) of
+            when FileFound(status as found: FileStatus) do
+                if not sameKind(found.kind, kindRegular) then
+                    addResult(&~checkup, name, path, false, "not a regular file", fix);
+                    return nil;
+                end if;
+                if secret and (found.mode /= 384) and (found.mode /= 256) then
+                    addResult(&~checkup, name, path, false, "others than its owner may read it", "chmod 600 the file");
+                    return nil;
+                end if;
+                addResult(&~checkup, name, path, true, "", "");
+            when FileMissing do
+                addResult(&~checkup, name, path, false, "missing", fix);
+            when FileUnreadable do
+                addResult(&~checkup, name, path, false, "not readable here", fix);
+        end case;
+        return nil;
+    end;
+
+    -- The socket check of roxie doctor: something that is no file and no
+    -- directory at path, the socket of a running collector.
+    generic [R: Region, P: Region]
+    function socketCheck(checkup: &![Checkup, R], path: Span[Nat8, P]): Unit is
+        case statusOf(path) of
+            when FileFound(status as found: FileStatus) do
+                if sameKind(found.kind, kindOther) then
+                    addResult(&~checkup, "socket", path, true, "", "");
+                else
+                    addResult(&~checkup, "socket", path, false, "no socket", "systemctl restart roxie");
+                end if;
+            when FileMissing do
+                addResult(&~checkup, "socket", path, false, "missing: the collector does not run", "systemctl start roxie");
+            when FileUnreadable do
+                addResult(&~checkup, "socket", path, false, "not readable here", "run roxie doctor as roxie or root");
+        end case;
+        return nil;
+    end;
+
+    -- roxie doctor: the files of the collector in the working directory
+    -- and its socket, as text or with --json as JSON; success when none is
+    -- missing.  It changes nothing.
+    generic [R: Region]
+    function doctorCommand(m: &[Matches, R], keys: Keys): ExitCode is
+        let install: Span[Nat8, Static] := "sudo bash install-server.sh BUNDLE SHA256 (deploy/install-server.sh)";
+        let start: Span[Nat8, Static] := "the collector makes it at its start: systemctl restart roxie";
+        -- A user tool, so the checkup looks at the user it runs as: roxie runs
+        -- as roxie (deploy/roxie.service), not as the _roxie Standard.Paths
+        -- names a service's account.
+        var checkup: Checkup := makeCheckup("roxie", UserTool());
+        fileCheck(&!checkup, "store", database_path, false, start);
+        fileCheck(&!checkup, "form key", key_path, true, start);
+        fileCheck(&!checkup, "pseudonym key", pseudonym_key_path, true, start);
+        fileCheck(&!checkup, "RAMBO settings", rambo_conf_path, false, install);
+        fileCheck(&!checkup, "RAMBO secret", rambo_secret_path, true, "sudo bash rambo-secret.sh (deploy/rambo-secret.sh)");
+        fileCheck(&!checkup, "htmx", htmx_path, false, install);
+        fileCheck(&!checkup, "known passwords", known_passwords_path, false, install);
+        case socketOf(m, keys) of
+            when Some(value as path: String) do
+                socketCheck(&!checkup, asSpan(&path));
+                destroyString(path);
+            when None do
+                addResult(&!checkup, "socket", "", false, "no socket path", "give one with --socket or ROXIE_SOCKET");
+        end case;
+        var out: StringBuilder := makeStringBuilder();
+        let missing: Index := runCheckup(&checkup, flagCount(m, keys.json) > 0, &!out);
+        destroyCheckup(checkup);
+        let text: String := finalize(out);
+        print(asSpan(&text));
+        destroyString(text);
+        if missing = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command(&!power);
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

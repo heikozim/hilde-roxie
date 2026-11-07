@@ -1,0 +1,645 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Batches kept in a database in memory: the host from the token, a batch
+-- sent again, one cut short and sent again, a refused one, the counts in
+-- Wolly.Metrics, and whole requests with and without a token.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    contains
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    removeFileIfThere
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withText,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    rollback,
+    isBusy,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Bearer (
+    issueToken
+);
+import Wolly.Metrics (
+    latestMetric
+);
+import Roxie.Wire (
+    WireError,
+    batchHeader,
+    writeLine
+);
+import Roxie.Ingest (
+    IngestOutcome,
+    Kept,
+    Repeated,
+    NotAHost,
+    BadBatch,
+    IngestStorage,
+    storageLine,
+    PruneReport,
+    RelevelReport,
+    RelevelPart,
+    relevelLines,
+    relevelAfter,
+    mostPruneSteps,
+    prepareIngest,
+    pruneBefore,
+    ingest,
+    ingestAnswer,
+    answerIngest,
+    certificateHost
+);
+
+module body Roxie.Ingest.Test is
+    constant now: Int64 := 1792022400;
+
+    function nameOf(outcome: IngestOutcome): Span[Nat8, Static] is
+        case outcome of
+            when Kept(count as kept: Int64) do
+                return "Kept";
+            when Repeated do
+                return "Repeated";
+            when NotAHost do
+                return "NotAHost";
+            when BadBatch(reason as error: WireError) do
+                return "BadBatch";
+            when IngestStorage(step as step: Span[Nat8, Static], code as code: Int32) do
+                return "IngestStorage";
+        end case;
+    end;
+
+    function keptOf(outcome: IngestOutcome): Int64 is
+        case outcome of
+            when Kept(count as kept: Int64) do
+                return kept;
+            when Repeated do
+                return 0 - 1;
+            when NotAHost do
+                return 0 - 1;
+            when BadBatch(reason as error: WireError) do
+                return 0 - 1;
+            when IngestStorage(step as step: Span[Nat8, Static], code as code: Int32) do
+                return 0 - 1;
+        end case;
+    end;
+
+    -- A batch of number with lines texts, one a line of texts, each at
+    -- now, level error when it says so, else info.
+    function batchOf(number: Int64, first: Span[Nat8, Static], second: Span[Nat8, Static], third: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let header: String := batchHeader(number);
+        writeString(&!out, asSpan(&header));
+        destroyString(header);
+        let a: Bool := writeLine(&!out, now, "error", "/var/log/db.log", first);
+        if spanLength(second) > 0 then
+            let b: Bool := writeLine(&!out, now, "info", "/var/log/db.log", second);
+        end if;
+        if spanLength(third) > 0 then
+            let c: Bool := writeLine(&!out, now, "info", "/var/log/db.log", third);
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function sent(db: &![Database[Writing], R], host: Span[Nat8, Static], number: Int64, first: Span[Nat8, Static],
+                  second: Span[Nat8, Static], third: Span[Nat8, Static], wanted: Span[Nat8, Static], kept: Int64,
+                  message: Span[Nat8, Static]): Unit is
+        let data: String := batchOf(number, first, second, third);
+        let outcome: IngestOutcome := ingest(&~db, host, asSpan(&data), now);
+        destroyString(data);
+        let fit: Bool := equal(nameOf(outcome), wanted) and ((kept < 0) or (keptOf(outcome) = kept));
+        if not fit then
+            printLn(nameOf(outcome));
+        end if;
+        assertTrue(fit, message);
+        return nil;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The lines kept for host.
+    generic [R: Region]
+    function linesOf(db: &![Database[Writing], R], host: Span[Nat8, Static]): Int64 is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM wolly_log_lines WHERE host = ?", withText(noValues(), host));
+        var count: Int64 := 0 - 1;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return 0 - 1;
+            when None do
+                return count;
+        end case;
+    end;
+
+    generic [R: Region]
+    function latest(db: &![Database[Writing], R], name: Span[Nat8, Static]): Int64 is
+        case latestMetric(&~db, name) of
+            when Right(right as value: Option[Int64]) do
+                case value of
+                    when Some(value as number: Int64) do
+                        return number;
+                    when None do
+                        return 0 - 1;
+                end case;
+            when Left(left as error: DbError) do
+                return 0 - 1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        assertTrue(prepareIngest(&~db), "the tables again");
+        sent(&~db, "bad host", 1, "x", "", "", "NotAHost", 0 - 1, "a token owner that is no host");
+        sent(&~db, "web1.example.org", 1, "mariadb: table full", "connection to mariadb", "", "Kept", 2, "a batch of two lines");
+        assertTrue(linesOf(&~db, "web1.example.org") = 2, "two lines of the host");
+        assertTrue(latest(&~db, "roxie.lines") = 2, "two lines counted");
+        assertTrue(latest(&~db, "roxie.errors") = 1, "one error counted");
+        sent(&~db, "web1.example.org", 1, "mariadb: table full", "connection to mariadb", "", "Repeated", 0 - 1, "the same batch again");
+        assertTrue(linesOf(&~db, "web1.example.org") = 2, "nothing kept twice");
+        sent(&~db, "web1.example.org", 3, "a", "b", "c", "Kept", 3, "a later batch");
+        sent(&~db, "web1.example.org", 2, "old", "", "", "Repeated", 0 - 1, "an older batch");
+        assertTrue(linesOf(&~db, "web1.example.org") = 5, "five lines");
+        sent(&~db, "web2.example.org", 1, "host=web1.example.org pretends", "", "", "Kept", 1, "another host");
+        assertTrue(linesOf(&~db, "web1.example.org") = 5, "a line names a host, the token decides");
+        assertTrue(linesOf(&~db, "web2.example.org") = 1, "the line of the second host");
+        -- web3 was cut short after one line of batch 7.
+        case execute(&~db, "INSERT INTO roxie_batches (host, number, kept) VALUES ('web3.example.org', 7, 1)", noValues()) of
+            when Left(left as error: DbError) do
+                assertTrue(false, "a batch cut short");
+            when Right(right as made: Nat64) do
+                assertTrue(true, "a batch cut short");
+        end case;
+        sent(&~db, "web3.example.org", 7, "first", "second", "third", "Kept", 2, "kept on after the first line");
+        assertTrue(linesOf(&~db, "web3.example.org") = 2, "the first line not twice");
+        assertTrue(latest(&~db, "roxie.refused") = (0 - 1), "nothing refused yet");
+        let outcome: IngestOutcome := ingest(&~db, "web1.example.org", "roxie 1 9\n1\tERROR\t/a\tx\n", now);
+        assertTrue(equal(nameOf(outcome), "BadBatch"), "a refused batch");
+        let answer: String := ingestAnswer(outcome);
+        assertTrue(contains(asSpan(&answer), "Status: 400"), "400");
+        assertTrue(contains(asSpan(&answer), "line 1: BadLevel"), "the line and the problem");
+        destroyString(answer);
+        assertTrue(latest(&~db, "roxie.refused") = 1, "a refused batch counted");
+        assertTrue(linesOf(&~db, "web1.example.org") = 5, "nothing of it kept");
+        assertTrue(mostPruneSteps() = 10000, "10000 steps a prune");
+        let early: PruneReport := pruneBefore(&~db, now);
+        assertTrue((early.lines = 0) and early.whole, "nothing before the time of the lines");
+        assertTrue(linesOf(&~db, "web1.example.org") = 5, "every line stays");
+        let late: PruneReport := pruneBefore(&~db, now + 1);
+        assertTrue(late.whole, "a prune that went through");
+        assertTrue(late.lines = 8, "every line of the three hosts: 5, 1 and 2");
+        assertTrue(late.samples > 0, "the samples too");
+        assertTrue(linesOf(&~db, "web1.example.org") = 0, "no line left of web1");
+        assertTrue(latest(&~db, "roxie.lines") = (0 - 1), "no sample left");
+        return nil;
+    end;
+
+    -- The first text of a query, "" for no row.
+    generic [R: Region]
+    function textOf(db: &![Database[Writing], R], sql: Span[Nat8, Static], key: Span[Nat8, Static]): String is
+        var cursor: Cursor := start(&~db, sql, withText(noValues(), key));
+        var found: String := fromSpan("");
+        if advance(&!cursor) then
+            destroyString(found);
+            found := fromSpan(columnText(&cursor, 0));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a query of the test");
+            when None do
+                skip;
+        end case;
+        return found;
+    end;
+
+    generic [R: Region]
+    function levelIs(db: &![Database[Writing], R], id: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let level: String := textOf(&~db, "SELECT level FROM wolly_log_lines WHERE id = CAST(? AS INTEGER)", id);
+        if not equal(asSpan(&level), wanted) then
+            printLn(asSpan(&level));
+        end if;
+        assertTrue(equal(asSpan(&level), wanted), message);
+        destroyString(level);
+        return nil;
+    end;
+
+    --: three lines kept with the levels an older agent gave them.
+    generic [R: Region]
+    function exerciseRelevel(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        var out: StringBuilder := makeStringBuilder();
+        let header: String := batchHeader(1);
+        writeString(&!out, asSpan(&header));
+        destroyString(header);
+        let a: Bool := writeLine(&!out, now, "error", "/var/log/syslog", "audit-api[1476]: {\"level\":\"INFO\",\"msg\":\"audit\",\"error_class\":\"\"}");
+        let b: Bool := writeLine(&!out, now, "info", "/var/log/syslog", "systemd[1]: Started a service.");
+        let c: Bool := writeLine(&!out, now, "info", "/var/log/syslog", "kernel: disk failed");
+        let data: String := finalize(out);
+        let outcome: IngestOutcome := ingest(&~db, "web1.example.org", asSpan(&data), now);
+        destroyString(data);
+        assertTrue(equal(nameOf(outcome), "Kept"), "three lines kept");
+        levelIs(&~db, "1", "error", "the control: line 1 kept as error, as the old agent said");
+        let first: RelevelReport := relevelLines(&~db);
+        assertTrue(first.whole, "the relevel goes through");
+        assertTrue(first.seen = 3, "three lines read");
+        assertTrue(first.changed = 2, "two levels changed: the JSON line and the failed disk");
+        levelIs(&~db, "1", "info", "the JSON line is info now");
+        levelIs(&~db, "2", "info", "the plain line stays info");
+        levelIs(&~db, "3", "error", "the failed disk is error now");
+        let title: String := textOf(&~db, "SELECT title FROM hilde_search WHERE key = ?", "1");
+        assertTrue(equal(asSpan(&title), "web1.example.org /var/log/syslog info"), "the title of its index row follows, which Wolly.Query compares");
+        destroyString(title);
+        let documents: String := textOf(&~db, "SELECT count(*) FROM hilde_search WHERE key = ?", "1");
+        assertTrue(equal(asSpan(&documents), "1"), "one document of the line, not a second beside it");
+        destroyString(documents);
+        let second: RelevelReport := relevelLines(&~db);
+        assertTrue(second.whole and ((second.seen = 3) and (second.changed = 0)), "a second run changes nothing");
+        return nil;
+    end;
+
+    --: 25 lines whose level is wrong, written 10 a transaction by
+    -- one step; all changed, and a step after the last reads nothing.
+    generic [R: Region]
+    function exerciseRelevelParts(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        var out: StringBuilder := makeStringBuilder();
+        let header: String := batchHeader(1);
+        writeString(&!out, asSpan(&header));
+        destroyString(header);
+        var i: Int64 := 0;
+        var written: Bool := true;
+        while i < 25 do
+            written := written and writeLine(&!out, now, "info", "/var/log/syslog", "kernel: disk failed");
+            i := i + 1;
+        end while;
+        let data: String := finalize(out);
+        let outcome: IngestOutcome := ingest(&~db, "web1.example.org", asSpan(&data), now);
+        destroyString(data);
+        assertTrue(written and equal(nameOf(outcome), "Kept"), "25 lines kept as info");
+        let part: RelevelPart := relevelAfter(&~db, 0);
+        assertTrue(part.whole and ((part.seen = 25) and (part.changed = 25)), "one step reads 25 and changes 25");
+        assertTrue(part.last = 25, "the last id read");
+        levelIs(&~db, "1", "error", "the first of the first transaction");
+        levelIs(&~db, "11", "error", "the first of the second");
+        levelIs(&~db, "25", "error", "the last of the third, of 5");
+        let after: RelevelPart := relevelAfter(&~db, part.last);
+        assertTrue(after.whole and ((after.seen = 0) and (after.changed = 0)), "after the last line nothing is read");
+        let again: RelevelPart := relevelAfter(&~db, 0);
+        assertTrue(again.whole and ((again.seen = 25) and (again.changed = 0)), "a second run changes nothing");
+        return nil;
+    end;
+
+    function testRelevelParts(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseRelevelParts(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testRelevel(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseRelevel(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- /tmp/roxie-ingest-<16 hex digits>.db
+    function tempStore(): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/tmp/roxie-ingest-");
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                destroyString(raw);
+            when None do
+                abort("no random bytes");
+        end case;
+        writeString(&!out, ".db");
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function removeStore(path: Span[Nat8, P]): Unit is
+        let a: Bool := removeFileIfThere(path);
+        var wal: StringBuilder := makeStringBuilder();
+        writeString(&!wal, path);
+        writeString(&!wal, "-wal");
+        let wal_path: String := finalize(wal);
+        let b: Bool := removeFileIfThere(asSpan(&wal_path));
+        destroyString(wal_path);
+        var shm: StringBuilder := makeStringBuilder();
+        writeString(&!shm, path);
+        writeString(&!shm, "-shm");
+        let shm_path: String := finalize(shm);
+        let c: Bool := removeFileIfThere(asSpan(&shm_path));
+        destroyString(shm_path);
+        return nil;
+    end;
+
+    -- Two connections to one file: while the first holds a write
+    -- transaction, the begin of the second waits (Hilde's binding, 5 s on
+    -- the clock) and answers busy; once the first is rolled back, it
+    -- begins.  /ingest and roxie prune rely on that wait.
+    generic [A: Region, B: Region]
+    function waitsForTheOther(first: &![Database[Writing], A], second: &![Database[Writing], B]): Unit is
+        case begin(&~first) of
+            when Left(left as error: DbError) do
+                assertTrue(false, "the first begins");
+            when Right(right as held: Transaction) do
+                let before: Nat64 := wallNanos();
+                case begin(&~second) of
+                    when Right(right as open: Transaction) do
+                        assertTrue(false, "a second writer while the first holds the store");
+                        rollback(&~second, open);
+                    when Left(left as error: DbError) do
+                        assertTrue(isBusy(error), "the second is busy after its wait");
+                        -- 5 s on the clock; 4 s is still allowed.
+                        assertTrue((wallNanos() - before) >= (4000000000 : Nat64), "the second waited");
+                end case;
+                rollback(&~first, held);
+        end case;
+        case begin(&~second) of
+            when Right(right as open: Transaction) do
+                rollback(&~second, open);
+            when Left(left as error: DbError) do
+                assertTrue(false, "the second begins once the first is done");
+        end case;
+        return nil;
+    end;
+
+    function testBusyBeginWaits(): Unit is
+        let path: String := tempStore();
+        case openSqlite(asSpan(&path)) of
+            when Right(right as one: Database[Writing]) do
+                var first: Database[Writing] := one;
+                case openSqlite(asSpan(&path)) of
+                    when Right(right as two: Database[Writing]) do
+                        var second: Database[Writing] := two;
+                        waitsForTheOther(&!first, &!second);
+                        closeDatabase(second);
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a second connection");
+                end case;
+                closeDatabase(first);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a store in /tmp");
+        end case;
+        removeStore(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    function testIngest(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testAnswers(): Unit is
+        let kept: String := ingestAnswer(Kept(count => 3));
+        assertTrue(contains(asSpan(&kept), "Status: 200") and contains(asSpan(&kept), "kept 3"), "kept");
+        destroyString(kept);
+        let again: String := ingestAnswer(Repeated());
+        assertTrue(contains(asSpan(&again), "Status: 200") and contains(asSpan(&again), "repeated"), "repeated");
+        destroyString(again);
+        let host: String := ingestAnswer(NotAHost());
+        assertTrue(contains(asSpan(&host), "Status: 403"), "403");
+        destroyString(host);
+        let failed: String := ingestAnswer(IngestStorage(step => "the commit", code => 5));
+        assertTrue(contains(asSpan(&failed), "Status: 500") and (not contains(asSpan(&failed), "SQL")) and (not contains(asSpan(&failed), "commit")), "500 without detail to the agent");
+        destroyString(failed);
+        let line: String := storageLine("the commit", 5);
+        assertTrue(equal(asSpan(&line), "roxie: /ingest could not keep a batch at the commit: SQLite code 5"), "the journal says where and the code");
+        destroyString(line);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, S]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test");
+        end case;
+        return nil;
+    end;
+
+    -- A request of verb with the header Authorization when given, the
+    -- subject of a client certificate as the web server gives it when
+    -- given, and data as its body.
+    generic [A: Region, S: Region, D: Region]
+    function request(verb: Span[Nat8, Static], authorization: Span[Nat8, A], subject: Span[Nat8, S], data: Span[Nat8, D]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", verb);
+        addPair(&!params, "REQUEST_URI", "/ingest");
+        if spanLength(authorization) > 0 then
+            addPair(&!params, "HTTP_AUTHORIZATION", authorization);
+        end if;
+        if spanLength(subject) > 0 then
+            addPair(&!params, "TLS_SUBJECT_DN", subject);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(data));
+    end;
+
+    generic [R: Region, A: Region]
+    function answered(db: &![Database[Writing], R], verb: Span[Nat8, Static], authorization: Span[Nat8, A],
+                      status: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        answeredAs(&~db, verb, authorization, "CN=web1.example.org", status, message);
+        return nil;
+    end;
+
+    generic [R: Region, A: Region]
+    function answeredAs(db: &![Database[Writing], R], verb: Span[Nat8, Static], authorization: Span[Nat8, A],
+                        subject: Span[Nat8, Static], status: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let incoming: Request := request(verb, authorization, subject, "roxie 1 1\n1\tinfo\t/a\tthrough a request\n");
+        let answer: String := answerIngest(&~db, &incoming, now);
+        destroyRequest(incoming);
+        if not contains(asSpan(&answer), status) then
+            printLn(asSpan(&answer));
+        end if;
+        assertTrue(contains(asSpan(&answer), status), message);
+        destroyString(answer);
+        return nil;
+    end;
+
+    -- The host certificateHost reads in subject is wanted, or none when
+    -- wanted is empty.
+    function certifies(subject: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case certificateHost(subject) of
+            when Some(value as host: String) do
+                assertTrue(((spanLength(wanted) > 0) and contains(asSpan(&host), wanted)) and (spanLength(asSpan(&host)) = spanLength(wanted)), message);
+                destroyString(host);
+            when None do
+                assertTrue(spanLength(wanted) = 0, message);
+        end case;
+        return nil;
+    end;
+
+    function testCertificateHost(): Unit is
+        certifies("CN=server", "server", "CN alone");
+        certifies("O=Heiko, CN=server", "server", "CN after another field");
+        certifies("CN=web1.example.org, O=Heiko", "web1.example.org", "CN before another field");
+        certifies("C=DE, O=Heiko, OU=Logs, CN=a.b", "a.b", "CN last of four");
+        certifies("O=Heiko", "", "no CN");
+        certifies("", "", "an empty subject");
+        certifies("CN=", "", "an empty CN");
+        certifies("CN=a, CN=b", "", "CN twice");
+        certifies("O=xCN=evil", "", "CN inside another field's value");
+        certifies("O=a,CN=evil", "", "CN after a comma without its space");
+        certifies("CN=Server", "", "capitals");
+        certifies("CN=ata rax", "", "a space");
+        certifies("CN=*.example.org", "", "a star");
+        certifies("CN=atarax_1", "", "an underscore");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exerciseRequests(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        answered(&~db, "GET", "", "Status: 405", "a GET");
+        answered(&~db, "POST", "", "Status: 401", "no token");
+        answered(&~db, "POST", "Bearer 00", "Status: 401", "a token never given out");
+        case issueToken(&~db, "web1.example.org", now) of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as token: String) do
+                        var header: StringBuilder := makeStringBuilder();
+                        writeString(&!header, "Bearer ");
+                        writeString(&!header, asSpan(&token));
+                        destroyString(token);
+                        let line: String := finalize(header);
+                        answeredAs(&~db, "POST", asSpan(&line), "", "Status: 403", "no client certificate");
+                        answeredAs(&~db, "POST", asSpan(&line), "O=Heiko", "Status: 403", "a certificate without CN");
+                        answeredAs(&~db, "POST", asSpan(&line), "CN=web2.example.org", "Status: 403",
+                                   "the certificate of another host with this host's token");
+                        answeredAs(&~db, "POST", asSpan(&line), "CN=WEB1.example.org", "Status: 403", "a CN in capitals");
+                        answeredAs(&~db, "POST", "", "CN=web1.example.org", "Status: 401", "a certificate without a token");
+                        answered(&~db, "POST", asSpan(&line), "kept 1", "the token of a host");
+                        answered(&~db, "POST", asSpan(&line), "repeated", "the same batch again");
+                        answeredAs(&~db, "POST", asSpan(&line), "O=Heiko, CN=web1.example.org", "repeated",
+                                   "CN after another field");
+                        destroyString(line);
+                    when None do
+                        assertTrue(false, "a token");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a token");
+        end case;
+        case issueToken(&~db, "not_a_host", now) of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as token: String) do
+                        var header: StringBuilder := makeStringBuilder();
+                        writeString(&!header, "Bearer ");
+                        writeString(&!header, asSpan(&token));
+                        destroyString(token);
+                        let line: String := finalize(header);
+                        answered(&~db, "POST", asSpan(&line), "Status: 403", "a token of something that is no host");
+                        destroyString(line);
+                    when None do
+                        assertTrue(false, "a token");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a token");
+        end case;
+        assertTrue(linesOf(&~db, "web1.example.org") = 1, "one line through the requests");
+        return nil;
+    end;
+
+    function testRequests(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseRequests(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

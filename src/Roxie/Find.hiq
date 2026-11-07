@@ -1,0 +1,489 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    substring,
+    parseInt,
+    isDigit
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Calendar (
+    Instant,
+    formatRfc3339
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.Json (
+    JsonWriter,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString as writeJsonString,
+    writeInteger,
+    writeNull,
+    finishJson
+);
+import Wolly.Query (
+    QueryError,
+    QueryFailure,
+    QueryRefused,
+    TooManyLines,
+    QueryStorage,
+    QueryResult,
+    findByQuery
+);
+import Wolly.LogStore (
+    lineOf
+);
+import Wolly.Response (
+    decimalText
+);
+import Roxie.Web (
+    problemText
+);
+
+module body Roxie.Find is
+    constant shown_most: Int64 := 100;
+    constant shown_default: Int64 := 20;
+    constant looks_at_most: Int64 := 1000000;
+    constant schema: Int64 := 1;
+
+    function mostShown(): Int64 is
+        return shown_most;
+    end;
+
+    function defaultShown(): Int64 is
+        return shown_default;
+    end;
+
+    function mostLinesLooked(): Int64 is
+        return looks_at_most;
+    end;
+
+    function schemaVersion(): Int64 is
+        return schema;
+    end;
+
+    function wide(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether text is digits only, 1 to most of them.
+    generic [T: Region]
+    function digitsOnly(text: Span[Nat8, T], most: Index): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > most) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if not isDigit(text[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether byte is the unit of a window: s, m, h, d or w.
+    function unitByte(byte: Nat8): Bool is
+        return (byte = 115) or (byte = 109) or (byte = 104) or (byte = 100) or (byte = 119);
+    end;
+
+    -- Whether since is a window: 1 to 9 digits and a unit.
+    generic [S: Region]
+    function isWindow(since: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(since);
+        if size < 2 then
+            return false;
+        end if;
+        if not unitByte(since[size - 1]) then
+            return false;
+        end if;
+        return digitsOnly(substring(since, 0, size - 1), 9);
+    end;
+
+    -- Whether since is shaped as a day: YYYY-MM-DD.  Whether it is a day
+    -- of the calendar Wolly.Query decides.
+    generic [S: Region]
+    function isDay(since: Span[Nat8, S]): Bool is
+        if spanLength(since) /= 10 then
+            return false;
+        end if;
+        if (since[4] /= 45) or (since[7] /= 45) then
+            return false;
+        end if;
+        return digitsOnly(substring(since, 0, 4), 4) and digitsOnly(substring(since, 5, 7), 2) and digitsOnly(substring(since, 8, 10), 2);
+    end;
+
+    generic [Q: Region, S: Region]
+    function withSince(query: Span[Nat8, Q], since: Span[Nat8, S], now: Int64): Option[String] is
+        if spanLength(since) = 0 then
+            return Some(value => fromSpan(query));
+        end if;
+        let window: Bool := isWindow(since);
+        let start: Bool := isDay(since) or ((spanLength(since) >= 9) and digitsOnly(since, 12));
+        if not (window or start) then
+            return None();
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "(");
+        writeString(&!out, query);
+        if window then
+            writeString(&!out, ") and time:last ");
+            writeString(&!out, since);
+        else
+            writeString(&!out, ") and time:[");
+            writeString(&!out, since);
+            writeString(&!out, " .. ");
+            let up_to: String := decimalText(now);
+            writeString(&!out, asSpan(&up_to));
+            destroyString(up_to);
+            writeString(&!out, "]");
+        end if;
+        return Some(value => finalize(out));
+    end;
+
+    -- seconds as RFC 3339 in UTC, or its digits.
+    function timeText(seconds: Int64): String is
+        case formatRfc3339(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return decimalText(seconds);
+        end case;
+    end;
+
+    -- The place of the first tab of text from first on, or the end.
+    generic [T: Region]
+    function tabAfter(text: Span[Nat8, T], first: Index): Index is
+        var i: Index := first;
+        while i < spanLength(text) do
+            if text[i] = 9 then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    -- A line as Wolly.LogStore.lineOf gives it: at, host, source, level and
+    -- the text between tabs, the line end cut.
+    record Row: Linear is
+        at: Int64;
+        host: String;
+        source: String;
+        level: String;
+        text: String;
+    end;
+
+    generic [T: Region]
+    function rowOf(line: Span[Nat8, T]): Row is
+        var stop: Index := spanLength(line);
+        if stop > 0 then
+            if line[stop - 1] = 10 then
+                stop := stop - 1;
+            end if;
+        end if;
+        let tab1: Index := tabAfter(line, 0);
+        let tab2: Index := tabAfter(line, tab1 + 1);
+        let tab3: Index := tabAfter(line, tab2 + 1);
+        let tab4: Index := tabAfter(line, tab3 + 1);
+        var at: Int64 := 0;
+        case parseInt(substring(line, 0, tab1)) of
+            when Some(value as seconds: Int64) do
+                at := seconds;
+            when None do
+                skip;
+        end case;
+        return Row(at => at, host => fromSpan(substring(line, tab1 + 1, tab2)), source => fromSpan(substring(line, tab2 + 1, tab3)),
+                   level => fromSpan(substring(line, tab3 + 1, tab4)), text => fromSpan(substring(line, tab4 + 1, stop)));
+    end;
+
+    -- The row of key, or None when the store has no line of that number.
+    generic [R: Region]
+    function rowAt(db: &![Database[Writing], R], key: Int64): Either[DbError, Option[Row]] is
+        let digits: String := decimalText(key);
+        let found: Either[DbError, Option[String]] := lineOf(&~db, asSpan(&digits));
+        destroyString(digits);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as line: Option[String]) do
+                case line of
+                    when Some(value as text: String) do
+                        let row: Row := rowOf(asSpan(&text));
+                        destroyString(text);
+                        return Right(right => Some(value => row));
+                    when None do
+                        return Right(right => None());
+                end case;
+        end case;
+    end;
+
+    -- The fields every JSON of roxie query begins with.
+    generic [W: Region, Q: Region, V: Region]
+    function writeHead(writer: &![JsonWriter, W], query: Span[Nat8, Q], now: Int64, version: Span[Nat8, V]): Unit is
+        beginObject(&~writer);
+        writeName(&~writer, "schema");
+        writeInteger(&~writer, schema);
+        writeName(&~writer, "version");
+        writeJsonString(&~writer, version);
+        writeName(&~writer, "query");
+        writeJsonString(&~writer, query);
+        writeName(&~writer, "now");
+        writeInteger(&~writer, now);
+        return nil;
+    end;
+
+    -- The JSON a writer finished, with a line end; None when the writer
+    -- was spoilt.
+    function finished(writer: JsonWriter): Option[String] is
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, asSpan(&text));
+                writeByte(&!out, 10);
+                destroyString(text);
+                return Some(value => finalize(out));
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The answer of a refusal: status, the kind of the error, its words
+    -- and the byte of the query where it is, if any.
+    generic [Q: Region, V: Region]
+    function failed(status: Int32, kind: Span[Nat8, Static], problem: Span[Nat8, Static], position: Option[Index],
+                    query: Span[Nat8, Q], now: Int64, json: Bool, version: Span[Nat8, V]): Answer is
+        var err: StringBuilder := makeStringBuilder();
+        writeString(&!err, "roxie: ");
+        writeString(&!err, problem);
+        case position of
+            when Some(value as at: Index) do
+                writeString(&!err, ", at byte ");
+                let digits: String := decimalText(wide(at));
+                writeString(&!err, asSpan(&digits));
+                destroyString(digits);
+                writeString(&!err, " of: ");
+                writeString(&!err, query);
+            when None do
+                skip;
+        end case;
+        writeByte(&!err, 10);
+        if not json then
+            return Answer(status => status, out => fromSpan(""), err => finalize(err));
+        end if;
+        var writer: JsonWriter := makeJsonWriter();
+        writeHead(&!writer, query, now, version);
+        writeName(&!writer, "error");
+        beginObject(&!writer);
+        writeName(&!writer, "kind");
+        writeJsonString(&!writer, kind);
+        writeName(&!writer, "problem");
+        writeJsonString(&!writer, problem);
+        writeName(&!writer, "position");
+        case position of
+            when Some(value as at: Index) do
+                writeInteger(&!writer, wide(at));
+            when None do
+                writeNull(&!writer);
+        end case;
+        endObject(&!writer);
+        endObject(&!writer);
+        case finished(writer) of
+            when Some(value as text: String) do
+                return Answer(status => status, out => text, err => finalize(err));
+            when None do
+                return Answer(status => status, out => fromSpan(""), err => finalize(err));
+        end case;
+    end;
+
+    generic [Q: Region, V: Region]
+    function storageAnswer(query: Span[Nat8, Q], json: Bool, version: Span[Nat8, V]): Answer is
+        return failed(4, "storage", "the store could not be read", None(), query, 0, json, version);
+    end;
+
+    -- The answer of what a query found: the lines of keys, read one by one.
+    generic [R: Region, K: Region, Q: Region, V: Region]
+    function foundAnswer(db: &![Database[Writing], R], total: Int64, keys: &[Buffer[Int64], K], query: Span[Nat8, Q], now: Int64,
+                         json: Bool, verbose: Bool, version: Span[Nat8, V]): Answer is
+        var text: StringBuilder := makeStringBuilder();
+        var writer: JsonWriter := makeJsonWriter();
+        writeHead(&!writer, query, now, version);
+        writeName(&!writer, "total");
+        writeInteger(&!writer, total);
+        writeName(&!writer, "shown");
+        writeInteger(&!writer, wide(length(keys)));
+        writeName(&!writer, "lines");
+        beginArray(&!writer);
+        var good: Bool := true;
+        var i: Index := 0;
+        while good and (i < length(keys)) do
+            let key: Int64 := nth(keys, i);
+            case rowAt(&~db, key) of
+                when Left(left as error: DbError) do
+                    good := false;
+                when Right(right as found: Option[Row]) do
+                    case found of
+                        when Some(value as row: Row) do
+                            let { at as at: Int64, host as host: String, source as source: String, level as level: String,
+                                  text as line: String } := row;
+                            let time: String := timeText(at);
+                            beginObject(&!writer);
+                            writeName(&!writer, "id");
+                            writeInteger(&!writer, key);
+                            writeName(&!writer, "at");
+                            writeInteger(&!writer, at);
+                            writeName(&!writer, "time");
+                            writeJsonString(&!writer, asSpan(&time));
+                            writeName(&!writer, "host");
+                            writeJsonString(&!writer, asSpan(&host));
+                            writeName(&!writer, "source");
+                            writeJsonString(&!writer, asSpan(&source));
+                            writeName(&!writer, "level");
+                            writeJsonString(&!writer, asSpan(&level));
+                            writeName(&!writer, "line");
+                            writeJsonString(&!writer, asSpan(&line));
+                            endObject(&!writer);
+                            writeString(&!text, asSpan(&time));
+                            writeByte(&!text, 9);
+                            writeString(&!text, asSpan(&host));
+                            writeByte(&!text, 9);
+                            writeString(&!text, asSpan(&level));
+                            writeByte(&!text, 9);
+                            writeString(&!text, asSpan(&source));
+                            writeByte(&!text, 9);
+                            writeString(&!text, asSpan(&line));
+                            writeByte(&!text, 10);
+                            destroyString(time);
+                            destroyString(host);
+                            destroyString(source);
+                            destroyString(level);
+                            destroyString(line);
+                        when None do
+                            skip;
+                    end case;
+            end case;
+            i := i + 1;
+        end while;
+        endArray(&!writer);
+        endObject(&!writer);
+        let lines: String := finalize(text);
+        let made: Option[String] := finished(writer);
+        if not good then
+            destroyString(lines);
+            case made of
+                when Some(value as out: String) do
+                    destroyString(out);
+                when None do
+                    skip;
+            end case;
+            return failed(4, "storage", "the store could not be read", None(), query, now, json, version);
+        end if;
+        var status: Int32 := 0;
+        if total = 0 then
+            status := 1;
+        end if;
+        if not json then
+            case made of
+                when Some(value as out: String) do
+                    destroyString(out);
+                when None do
+                    skip;
+            end case;
+            var said: StringBuilder := makeStringBuilder();
+            if verbose then
+                let all: String := decimalText(total);
+                writeString(&!said, asSpan(&all));
+                destroyString(all);
+                writeString(&!said, " lines in all, ");
+                let shown: String := decimalText(wide(length(keys)));
+                writeString(&!said, asSpan(&shown));
+                destroyString(shown);
+                writeString(&!said, " shown\n");
+            end if;
+            return Answer(status => status, out => lines, err => finalize(said));
+        end if;
+        destroyString(lines);
+        case made of
+            when Some(value as out: String) do
+                return Answer(status => status, out => out, err => fromSpan(""));
+            when None do
+                return failed(4, "storage", "a line could not be written as JSON", None(), query, now, false, version);
+        end case;
+    end;
+
+    generic [R: Region, Q: Region, S: Region, V: Region]
+    function answerQuery(db: &![Database[Writing], R], query: Span[Nat8, Q], since: Span[Nat8, S], now: Int64,
+                         limit: Int64, json: Bool, verbose: Bool, version: Span[Nat8, V]): Answer is
+        case withSince(query, since, now) of
+            when None do
+                return failed(2, "since", "--since is N and s, m, h, d or w, a day YYYY-MM-DD or seconds", None(), query, now, json, version);
+            when Some(value as full: String) do
+                let answer: Answer := runQuery(&~db, asSpan(&full), now, limit, json, verbose, version);
+                destroyString(full);
+                return answer;
+        end case;
+    end;
+
+    generic [R: Region, Q: Region, V: Region]
+    function runQuery(db: &![Database[Writing], R], query: Span[Nat8, Q], now: Int64, limit: Int64, json: Bool, verbose: Bool,
+                      version: Span[Nat8, V]): Answer is
+        case findByQuery(&~db, query, now, looks_at_most, limit, 0) of
+            when Left(left as failure: QueryFailure) do
+                case failure of
+                    when QueryRefused(reason as error: QueryError) do
+                        return failed(2, "refused", problemText(error.problem), Some(value => error.position), query, now, json, version);
+                    when TooManyLines do
+                        return failed(3, "too-many-lines", "more lines in the time window than a query looks at; add time:last 24h or --since", None(), query, now, json, version);
+                    when QueryStorage(error as error: DbError) do
+                        return failed(4, "storage", "the store could not be read", None(), query, now, json, version);
+                end case;
+            when Right(right as result: QueryResult) do
+                let { total as total: Int64, keys as keys: Buffer[Int64] } := result;
+                let answer: Answer := foundAnswer(&~db, total, &keys, query, now, json, verbose, version);
+                destroyFree(keys);
+                return answer;
+        end case;
+    end;
+
+    function destroyAnswer(answer: Answer): Unit is
+        let { status as s: Int32, out as o: String, err as e: String } := answer;
+        destroyString(o);
+        destroyString(e);
+        return nil;
+    end;
+end module body.

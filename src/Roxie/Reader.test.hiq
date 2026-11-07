@@ -1,0 +1,257 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    equal
+);
+import Standard.Search (
+    SearchError
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Bearer (
+    issueToken,
+    revokeTokens
+);
+import Wolly.LogStore (
+    keepLine
+);
+import Roxie.Ingest (
+    prepareIngest,
+    answerIngest
+);
+import Roxie.Reader (
+    readerOwner,
+    isReader,
+    answerReader
+);
+
+module body Roxie.Reader.Test is
+    -- 2026-10-15T00:00:00Z.
+    constant now: Int64 := 1792022400;
+
+    generic [N: Region]
+    function ownerIs(name: Span[Nat8, N], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case readerOwner(name) of
+            when Some(value as owner: String) do
+                assertTrue(equal(asSpan(&owner), wanted), message);
+                destroyString(owner);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [N: Region]
+    function ownerRefused(name: Span[Nat8, N], message: Span[Nat8, Static]): Unit is
+        case readerOwner(name) of
+            when Some(value as owner: String) do
+                destroyString(owner);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testOwners(): Unit is
+        ownerIs("audit", "_reader.audit", "a reader's owner");
+        ownerIs("audit-2", "_reader.audit-2", "with a digit and a hyphen");
+        ownerIs("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrst", "_reader.abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrst", "56 bytes");
+        ownerRefused("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstu", "57 bytes");
+        ownerRefused("", "no name");
+        ownerRefused("Audit", "a capital");
+        ownerRefused("lu_cio", "an underscore");
+        ownerRefused("lu.cio", "a dot");
+        ownerRefused("lu cio", "a space");
+        assertTrue(isReader("_reader.audit"), "a reader");
+        assertFalse(isReader("_reader."), "the prefix alone");
+        assertFalse(isReader("reader.audit"), "without the underscore");
+        assertFalse(isReader("server"), "a host");
+        assertFalse(isReader("_reade"), "shorter than the prefix");
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, S]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test");
+        end case;
+        return nil;
+    end;
+
+    -- A request of verb for /api/query with the query string and the header
+    -- Authorization when given.
+    generic [A: Region, Q: Region]
+    function request(verb: Span[Nat8, Static], authorization: Span[Nat8, A], query_string: Span[Nat8, Q]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", verb);
+        addPair(&!params, "REQUEST_URI", "/api/query");
+        addPair(&!params, "QUERY_STRING", query_string);
+        if spanLength(authorization) > 0 then
+            addPair(&!params, "HTTP_AUTHORIZATION", authorization);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    generic [R: Region, A: Region, Q: Region]
+    function asks(db: &![Database[Writing], R], verb: Span[Nat8, Static], authorization: Span[Nat8, A], query_string: Span[Nat8, Q],
+                  status: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let incoming: Request := request(verb, authorization, query_string);
+        let answer: String := answerReader(&~db, &incoming, now, "0.1.0");
+        destroyRequest(incoming);
+        let good: Bool := contains(asSpan(&answer), status) and contains(asSpan(&answer), part);
+        if not good then
+            printLn(asSpan(&answer));
+        end if;
+        assertTrue(good, message);
+        destroyString(answer);
+        return nil;
+    end;
+
+    -- The header Authorization of a token given to name.
+    generic [R: Region]
+    function bearerOf(db: &![Database[Writing], R], name: Span[Nat8, Static]): String is
+        case issueToken(&~db, name, now) of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as token: String) do
+                        var header: StringBuilder := makeStringBuilder();
+                        writeString(&!header, "Bearer ");
+                        writeString(&!header, asSpan(&token));
+                        destroyString(token);
+                        return finalize(header);
+                    when None do
+                        assertTrue(false, "a token given");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a token given");
+        end case;
+        return fromSpan("");
+    end;
+
+    generic [R: Region]
+    function keep(db: &![Database[Writing], R], host: Span[Nat8, Static], at: Int64, level: Span[Nat8, Static],
+                  text: Span[Nat8, Static]): Unit is
+        case keepLine(&~db, host, "/var/log/syslog", at, level, text) of
+            when Right(right as kept: Option[Int64]) do
+                case kept of
+                    when Some(value as id: Int64) do
+                        assertTrue(true, "a line kept");
+                    when None do
+                        assertTrue(false, "a line kept");
+                end case;
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "a line kept");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        keep(&~db, "server", now - 60, "error", "mariadb: Table is marked as crashed and should be repaired");
+        keep(&~db, "edge", now - 30, "error", "hiawatha: an error of edge");
+        keep(&~db, "edge", now - 172800, "info", "a line of two days ago");
+        let reader: String := bearerOf(&~db, "_reader.audit");
+        let agent: String := bearerOf(&~db, "edge");
+        let r: Span[Nat8, Static] := "q=host%3Aocea";
+        asks(&~db, "POST", asSpan(&reader), r, "Status: 405", "Allow: GET", "a POST");
+        asks(&~db, "GET", "", r, "Status: 401", "WWW-Authenticate: Bearer", "no token");
+        asks(&~db, "GET", "Bearer 00", r, "Status: 401", "WWW-Authenticate: Bearer", "a token never given out");
+        asks(&~db, "GET", asSpan(&agent), r, "Status: 403", "no reader's", "the token of an agent opens no query");
+        asks(&~db, "GET", asSpan(&reader), r, "Status: 200", "\"total\":2", "a reader's query: both lines of edge");
+        asks(&~db, "GET", asSpan(&reader), r, "application/json", "\"schema\":1", "JSON of schema 1");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea+and+level%3Aerror", "Status: 200", "\"total\":1", "a plus is a space");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&since=24h", "Status: 200", "\"total\":1", "since leaves the line of two days out");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=1", "Status: 200", "\"shown\":1", "limit 1");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=100", "Status: 200", "\"shown\":2", "limit 100");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=0", "Status: 400", "limit is 1 to 100", "limit 0");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=101", "Status: 400", "limit is 1 to 100", "limit 101");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=1000", "Status: 400", "limit is 1 to 100", "limit of 4 digits");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=-1", "Status: 400", "limit is 1 to 100", "a sign");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=99999999999999999999", "Status: 400", "limit is 1 to 100",
+             "a limit of 20 digits, no overflow");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&limit=", "Status: 400", "limit is 1 to 100", "an empty limit");
+        asks(&~db, "GET", asSpan(&reader), "limit=5", "Status: 400", "q is missing", "no q");
+        asks(&~db, "GET", asSpan(&reader), "q=level%3AERROR", "Status: 400", "\"kind\":\"refused\"", "a refused query, as JSON");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&since=24", "Status: 400", "\"kind\":\"since\"", "a refused since, as JSON");
+        asks(&~db, "GET", asSpan(&reader), "q=host%3Aocea&since=24h%29+or+%28host%3Aatarax", "Status: 400", "\"kind\":\"since\"",
+             "nothing of a query in since");
+        -- A reader's token sends no batch, whatever certificate comes with it.
+        let batch: Span[Nat8, Static] := "roxie 1 1\n1\tinfo\t/a\tfrom a reader\n";
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", "POST");
+        addPair(&!params, "REQUEST_URI", "/ingest");
+        addPair(&!params, "HTTP_AUTHORIZATION", asSpan(&reader));
+        addPair(&!params, "TLS_SUBJECT_DN", "CN=audit");
+        let block: String := finalize(params);
+        let posted: Request := makeRequest(block, fromSpan(batch));
+        let ingested: String := answerIngest(&~db, &posted, now);
+        destroyRequest(posted);
+        assertTrue(contains(asSpan(&ingested), "Status: 403"), "a reader's token sends no batch");
+        destroyString(ingested);
+        case revokeTokens(&~db, "_reader.audit") of
+            when Right(right as done: Bool) do
+                assertTrue(done, "the reader's tokens revoked");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the reader's tokens revoked");
+        end case;
+        asks(&~db, "GET", asSpan(&reader), r, "Status: 401", "WWW-Authenticate: Bearer", "a revoked token opens nothing");
+        destroyString(reader);
+        destroyString(agent);
+        return nil;
+    end;
+
+    function testReader(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,64 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The queries of a reader: a programme beside the collector, Audit
+first, asks GET /api/query with a token of its own and gets the JSON of
+roxie query --json, schema 1 of docs/syntax.md.
+
+- A reader's token is a token of Wolly.Bearer given to _reader.NAME
+  (roxie reader NAME).  No host name holds an underscore
+  (Wolly.Net.validHostname), so such a token never sends a batch: /ingest
+  takes only a host certified by its certificate.
+- The token of an agent opens no query: its owner is a host.
+- q is the query, limit 1 to 100 lines (20 without it), since the window
+  of roxie query --since.
+
+    GET /api/query?q=host%3Aocea+and+level%3Aerror&limit=50&since=1h
+    Authorization: Bearer <the token of _reader.audit>
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Roxie.Reader is
+    """
+    The owner of a reader's token for name: _reader.NAME, when name is 1
+    to 56 bytes of a to z, 0 to 9 and hyphen; None for any other name.
+
+    No contract: a parser answering an Option.
+    """
+    generic [N: Region]
+    function readerOwner(name: Span[Nat8, N]): Option[String];
+
+    """
+    Whether owner is a reader's: _reader. and at least one byte after it.
+    """
+    generic [O: Region]
+    function isReader(owner: Span[Nat8, O]): Bool
+        ensures (not result) or (spanLength(owner) > 8);
+
+    """
+    The CGI answer to the request of a reader at now: 405 for a verb other
+    than GET, 401 without a token that opens anything, 403 for a token
+    that is no reader's, 400 for a missing q or a limit outside 1 to 100,
+    and else the JSON of roxie query: 200 when it ran, 400 when the query,
+    since or the size of the window was refused, 503 when the store could
+    not be read.  version is the programme's, a field of the JSON.
+    (An answer of I/O: no ensures.)
+    """
+    generic [R: Region, Q: Region, V: Region]
+    function answerReader(db: &![Database[Writing], R], request: &[Request, Q], now: Int64,
+                          version: Span[Nat8, V]): String
+        requires now >= 0;
+end module.

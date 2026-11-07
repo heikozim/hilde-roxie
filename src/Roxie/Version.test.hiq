@@ -1,0 +1,50 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The number of a version: a tag, a tag with commits
+-- after it, a number without v, and what is no version; a test is built
+-- without one, so versionNumber is dev here.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Text (
+    equal
+);
+import Roxie.Version (
+    numberOf,
+    versionNumber
+);
+
+module body Roxie.Version.Test is
+    generic [V: Region]
+    function numberIs(version: Span[Nat8, V], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let number: Span[Nat8, V] := numberOf(version);
+        if not equal(number, wanted) then
+            printLn(number);
+        end if;
+        assertTrue(equal(number, wanted), message);
+        return nil;
+    end;
+
+    function testNumber(): Unit is
+        numberIs("v0.1.0", "0.1.0", "a tag");
+        numberIs("v9.8.7-3-gabcdef1", "9.8.7", "commits after the tag left out");
+        numberIs("0.2.0", "0.2.0", "a number without v");
+        numberIs("1.0.0+build.5", "1.0.0+build.5", "a plus is a byte of a version");
+        numberIs("v1.0.0-z", "1.0.0", "a z after the minus");
+        numberIs("0.9.0+zz", "0.9.0+zz", "a z is a letter of a version");
+        numberIs("", "", "no version");
+        numberIs("v", "", "a v alone");
+        numberIs("v-1", "", "a minus first");
+        numberIs("vx1", "", "no digit after the v");
+        numberIs("x1.0", "", "no digit first");
+        numberIs("v1<script>", "", "a byte no version holds");
+        numberIs("v1 0", "", "a space");
+        numberIs("v1.0.0\"", "", "a quote");
+        assertTrue(equal(versionNumber(), "dev"), "a build without a version: dev");
+        return nil;
+    end;
+end module body.

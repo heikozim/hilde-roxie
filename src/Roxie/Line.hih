@@ -1,0 +1,77 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The time and the level of a log line from the line itself, for the
+forms the logs of server and edge are written in,
+without patterns:
+
+    syslog     2026-10-16T15:55:41.209004+02:00 server systemd[1]: ...
+               RFC 3339 up to the first space (Standard.Calendar), also
+               after a priority <12> and the version 1 of RFC 5424
+    Hiawatha   203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|200|502|GET ...
+               the address, a bar, the date in the form of Hiawatha, a
+               bar; in an access log the status follows
+    BSD        Oct 27 12:23:45 proxy unbound: ...
+               the syslog of OpenBSD (RFC 3164): month, day, time of
+               day, no year and no zone; read in the zone of the agent,
+               in the year of now, or the year before when that would
+               be more than a day ahead
+
+A line of neither form keeps the time the agent read it and the level of
+Roxie.Level.  A time after now is not taken: the collector refuses a
+batch with a line more than 300 seconds ahead of its clock.
+"""
+import Wolly.LogStore (
+    isLevel
+);
+import Standard.Calendar (
+    Zone
+);
+
+
+module Roxie.Line is
+    """
+    The seconds since 1970 the line says it was written at, for a line
+    of syslog or of Hiawatha, which name their offset; None when it is of
+    neither form, or its date does not exist.
+
+    No contract: a parser answering an Option.
+    """
+    generic [T: Region]
+    function parseLineTime(text: Span[Nat8, T]): Option[Int64];
+
+    """
+    The time of the line: what it says, when that is from 0 to now; now
+    otherwise.  A line of the BSD form is read in zone, the zone of the
+    host that wrote it.
+    """
+    generic [T: Region, Z: Region]
+    function lineTime(text: Span[Nat8, T], zone: &[Zone, Z], now: Int64): Int64
+        ensures result <= now;
+
+    """
+    The level of the line, the first of:
+
+    - the severity of a priority <PRI> at its start, up to 191: 0 to 3
+      error, 4 warn, 5 and 6 info, 7 debug;
+    - for a line of an access log of Hiawatha its status, error from 500,
+      warn from 400, info below;
+    - the first field "level":"…" (JSON) or level=… (logfmt, at
+      the start or after a space, quoted or not), when it names debug,
+      trace, info, notice, audit, warn or warning, in any case;
+    - info for a line of syslog in which systemd changed a job: its
+      program systemd[PID] and the message beginning with Starting,
+      Started, Stopping, Stopped, Finished, Reloading or Reloaded and a
+      space, as systemd writes them with the priority of info;
+    - Roxie.Level.guessLevel over the message of a line of syslog, after
+      "TIME HOST PROGRAM[PID]: " (TIME of RFC 3339 or of the BSD form),
+      and over the whole of every other line.
+    """
+    generic [T: Region]
+    function lineLevel(text: Span[Nat8, T]): Span[Nat8, Static]
+        ensures isLevel(result);
+end module.

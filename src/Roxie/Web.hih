@@ -1,0 +1,141 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The pages of the collector, drawn on the server from templates,
+without script: the head of the dashboard (the search field and the form
+to log out), the page of a search with the lines found, newest first, 50
+a page, and the form to log in.  The dashboard itself is Wolly.Dashboard
+with ROXIE's panels.
+
+A query that is refused is shown with its problem and the byte where it
+is, the rest of the query marked from there.  Everything a page shows is
+escaped by the templates: a log line is a visitor's text.
+
+Who may see a page is the duty of the handler that sends it (the
+programme, Roxie.App).
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Wolly.Dashboard (
+    Panel
+);
+import Wolly.Query (
+    QueryProblem
+);
+
+module Roxie.Web is
+    """
+    The lines of one page of a search: 50.
+    """
+    function linesPerPage(): Int64
+        ensures result = 50;
+
+    """
+    The most lines a search may look at in its time window: 1000000.
+    """
+    function mostLinesSearched(): Int64
+        ensures result = 1000000;
+
+    """
+    The panels of ROXIE's dashboard: lines and errors an hour over a day,
+    batches against the hour before, batches refused.
+    """
+    function roxiePanels(): Buffer[Panel]
+        ensures bufferLength(&result) = 4;
+
+    """
+    The panels of the hosts: for each host that sent lines in
+    the 24 hours before now a section with its sources, the lines, errors
+    and warnings of each and the time of its last line, every count a link
+    to its search; at most 500 sources, ordered by host and source.  The
+    whole is a <div id="panel-hosts"> that asks /panel/hosts for itself
+    again every every seconds, as a panel of Wolly.Dashboard does.  Left
+    only when SQLite refused the statement.  (An I/O result: no ensures.)
+    """
+    generic [R: Region]
+    function hostsPanel(db: &![Database[Writing], R], now: Int64, every: Int64): Either[DbError, String]
+        requires now >= 0
+        requires every >= 5;
+
+    """
+    What a problem of a query means, in a few words for the page.
+    """
+    function problemText(problem: QueryProblem): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The head of the dashboard: the search field holding text, and the form
+    to log out with the form token csrf.
+    """
+    generic [T: Region, C: Region]
+    function dashboardTop(text: Span[Nat8, T], csrf: Span[Nat8, C]): String
+        ensures length(&result) > 0;
+
+    """
+    The page of help at now: the head with an empty search field and the
+    form to log out with the form token csrf, then the whole query
+    language of the search field with its examples, each a link to its
+    search (templates/help.jinja, after docs/syntax.md).
+    """
+    generic [C: Region]
+    function helpPage(now: Int64, csrf: Span[Nat8, C]): String
+        requires now >= 0
+        ensures length(&result) > 0;
+
+    """
+    The foot of every page, after the pattern of TWEETY: ROXIE,
+    its version, the words its letters stand for and the holder, linked in
+    a new tab, as a <footer class="site-foot">.  The version is the one
+    the build was given as --build-value=version=..., the tag of git the
+    tree stood at (scripts/build-binary.sh), read through
+    Standard.BuildInfo, never typed in.
+    """
+    function footer(): String
+        ensures length(&result) > 0;
+
+    """
+    The foot of a page for version: v and the number of a tag such as
+    v0.1.0 or v0.1.0-3-gabcdef1, without its v and without all from its
+    first minus on; dev for an empty version, for one without a digit
+    after its v, and for one that holds a byte other than a letter, a
+    digit, a dot, a minus or a plus, so nothing of it needs escaping.
+    """
+    generic [V: Region]
+    function footerOf(version: Span[Nat8, V]): String
+        ensures length(&result) > 0;
+
+    """
+    page with foot before its first </body>, or a copy of page when it
+    has none, as a panel the dashboard asks for.  A page drawn here
+    escapes what it shows, so the first </body> is its end.
+    """
+    generic [P: Region, F: Region]
+    function withFooter(page: Span[Nat8, P], foot: Span[Nat8, F]): String
+        ensures (length(&result) = spanLength(page)) or (length(&result) = (spanLength(page) + spanLength(foot)));
+
+    """
+    The page of the search text from line offset on, at now: the lines found
+    or why the query is refused.  Left only when SQLite refused a
+    statement.  (An I/O result: no ensures.)
+    """
+    generic [R: Region, T: Region, C: Region]
+    function searchPage(db: &![Database[Writing], R], text: Span[Nat8, T], offset: Int64, now: Int64,
+                        csrf: Span[Nat8, C]): Either[DbError, String]
+        requires offset >= 0
+        requires now >= 0;
+end module.

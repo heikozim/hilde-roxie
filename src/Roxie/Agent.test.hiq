@@ -1,0 +1,194 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- What each answer of the collector does to a batch, and the token read
+-- from files under /tmp: kept only as 64 hex digits in a file of mode 0600.
+-- Sending itself needs a collector and runs end to end (scripts/e2e.sh).
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    FileDescriptor,
+    createNewFile,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Roxie.Agent (
+    SendVerdict,
+    TakenAway,
+    PutAside,
+    KeptBack,
+    mostSends,
+    verdictOf,
+    readToken,
+    RoundReport,
+    Tally,
+    movedAnything,
+    freshTally,
+    counted,
+    dueAt
+);
+
+module body Roxie.Agent.Test is
+    constant token: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    function nameOf(verdict: SendVerdict): Span[Nat8, Static] is
+        case verdict of
+            when TakenAway do
+                return "TakenAway";
+            when PutAside do
+                return "PutAside";
+            when KeptBack do
+                return "KeptBack";
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function testVerdicts(): Unit is
+        assertTrue(mostSends() = 100, "100 batches a round");
+        assertTrue(equal(nameOf(verdictOf(200)), "TakenAway"), "200");
+        assertTrue(equal(nameOf(verdictOf(400)), "PutAside"), "400");
+        assertTrue(equal(nameOf(verdictOf(401)), "KeptBack"), "401: the token");
+        assertTrue(equal(nameOf(verdictOf(403)), "KeptBack"), "403");
+        assertTrue(equal(nameOf(verdictOf(413)), "KeptBack"), "413: the web server's limit");
+        assertTrue(equal(nameOf(verdictOf(500)), "KeptBack"), "500");
+        assertTrue(equal(nameOf(verdictOf(0)), "KeptBack"), "no answer");
+        assertTrue(equal(nameOf(verdictOf(201)), "KeptBack"), "another 2xx");
+        return nil;
+    end;
+
+    function reportOf(collected: Int64, taken: Int64, set_aside: Int64, kept_back: Bool): RoundReport is
+        return RoundReport(collected => collected, taken => taken, setAside => set_aside, unreadable => 0, keptBack => kept_back,
+                           status => 0);
+    end;
+
+    function testMoved(): Unit is
+        assertTrue(not movedAnything(reportOf(0, 0, 0, false)), "a round of nothing moved nothing");
+        assertTrue(movedAnything(reportOf(1, 0, 0, false)), "a line collected");
+        assertTrue(movedAnything(reportOf(0, 1, 0, false)), "a batch taken");
+        assertTrue(movedAnything(reportOf(0, 0, 1, false)), "a batch set aside");
+        assertTrue(movedAnything(reportOf(0, 0, 0, true)), "a batch kept back");
+        return nil;
+    end;
+
+    function testTally(): Unit is
+        let fresh: Tally := freshTally(1000);
+        assertTrue((fresh.rounds = 0) and (fresh.said = 1000), "a fresh tally");
+        assertTrue((fresh.collected = 0) and ((fresh.taken = 0) and (fresh.setAside = 0)), "a fresh tally counts nothing");
+        let one: Tally := counted(fresh, reportOf(3, 1, 1, false));
+        let two: Tally := counted(one, reportOf(2, 1, 1, false));
+        assertTrue((two.collected = 5) and (two.taken = 2), "two rounds add their lines and batches");
+        assertTrue((two.setAside = 2) and (two.rounds = 2), "and their batches set aside and the rounds");
+        assertTrue(two.said = 1000, "the time of the last line stays");
+        return nil;
+    end;
+
+    function testDue(): Unit is
+        let quiet: RoundReport := reportOf(1, 1, 0, false);
+        let sent: Tally := counted(freshTally(1000), quiet);
+        assertTrue(not dueAt(sent, quiet, 1599, 600), "a round that went well waits for every seconds");
+        assertTrue(dueAt(sent, quiet, 1600, 600), "and is said when they have passed");
+        assertTrue(dueAt(sent, quiet, 999, 600), "and when the clock went back");
+        assertTrue(dueAt(sent, quiet, 1000, 0), "every 0 says each round");
+        assertTrue(dueAt(counted(freshTally(0), quiet), quiet, 5, 600), "the first round after the start is said at once");
+        let nothing: Tally := freshTally(1000);
+        assertTrue(not dueAt(nothing, reportOf(0, 0, 0, false), 99999, 600), "rounds that moved nothing say nothing");
+        assertTrue(not dueAt(nothing, reportOf(0, 0, 0, false), 1000, 0), "not even with every 0");
+        let aside: RoundReport := reportOf(0, 0, 1, false);
+        assertTrue(dueAt(counted(nothing, aside), aside, 1001, 600), "a batch set aside is said at once");
+        let kept: RoundReport := reportOf(0, 0, 0, true);
+        assertTrue(dueAt(counted(nothing, kept), kept, 1001, 600), "a batch kept back is said at once");
+        let lines: RoundReport := reportOf(4, 0, 0, false);
+        assertTrue(not dueAt(counted(nothing, lines), lines, 1001, 600), "lines collected alone wait as well");
+        assertTrue(dueAt(counted(nothing, lines), lines, 1600, 600), "and are said after every seconds");
+        return nil;
+    end;
+
+    function tempPath(): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/tmp/roxie-agent-");
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                destroyString(raw);
+            when None do
+                abort("no random bytes");
+        end case;
+        return finalize(out);
+    end;
+
+    -- The token read from a file of mode with text: wanted, or None when
+    -- wanted is empty.
+    function readsAs(mode: Nat32, text: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let path: String := tempPath();
+        case createNewFile(asSpan(&path), mode) of
+            when Some(value as made: FileDescriptor) do
+                var file: FileDescriptor := made;
+                assertTrue(writeAll(&!file, text), "written");
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the file made");
+        end case;
+        case readToken(asSpan(&path)) of
+            when Some(value as found: String) do
+                assertTrue(equal(asSpan(&found), wanted), message);
+                destroyString(found);
+            when None do
+                assertTrue(spanLength(wanted) = 0, message);
+        end case;
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    function testToken(): Unit is
+        readsAs(#o600, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", token, "64 hex digits");
+        readsAs(#o600, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", token, "with a line end, as roxie token writes it");
+        readsAs(#o600, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n", token, "with CR and LF");
+        readsAs(#o644, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", "", "a file others may read");
+        readsAs(#o600, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n", "", "63 digits");
+        readsAs(#o600, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0\n", "", "65 digits");
+        readsAs(#o600, "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef\n", "", "capitals");
+        readsAs(#o600, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg\n", "", "a g");
+        readsAs(#o600, "0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n", "", "two lines");
+        return nil;
+    end;
+end module body.

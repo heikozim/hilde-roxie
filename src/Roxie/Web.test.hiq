@@ -1,0 +1,408 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The pages: the head with a query and a token escaped, the form to log
+-- in, ROXIE's panels, and searches over lines in a database in memory --
+-- found, refused with the byte marked, and paged; the panels of the
+-- hosts; the foot of every page.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    equal
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    destroyFree
+);
+import Standard.Search (
+    SearchError
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Wolly.LogStore (
+    keepLine
+);
+import Wolly.Dashboard (
+    Panel,
+    validPanels
+);
+import Wolly.Query (
+    QueryProblem,
+    QueryTooLong,
+    NoQuery,
+    TooDeep,
+    TooManyTerms,
+    UnexpectedByte,
+    UnclosedQuote,
+    UnclosedParenthesis,
+    ExpectedTerm,
+    ExpectedOperator,
+    UnquotedWord,
+    UnknownQueryField,
+    BadValue,
+    BadTime,
+    BadRange,
+    TooManyWords,
+    TooManyTexts
+);
+import Roxie.Ingest (
+    prepareIngest
+);
+import Roxie.Web (
+    linesPerPage,
+    mostLinesSearched,
+    roxiePanels,
+    problemText,
+    dashboardTop,
+    searchPage,
+    helpPage,
+    hostsPanel,
+    footer,
+    footerOf,
+    withFooter
+);
+
+module body Roxie.Web.Test is
+    constant now: Int64 := 1792022400;
+
+    function testRules(): Unit is
+        assertTrue(linesPerPage() = 50, "50 lines a page");
+        assertTrue(mostLinesSearched() = 1000000, "a million lines a search");
+        let panels: Buffer[Panel] := roxiePanels();
+        assertTrue(length(&panels) = 4, "four panels");
+        assertTrue(validPanels(&panels), "panels the dashboard draws");
+        destroyFree(panels);
+        assertTrue(spanLength(problemText(QueryTooLong())) > 0, "QueryTooLong");
+        assertTrue(spanLength(problemText(NoQuery())) > 0, "NoQuery");
+        assertTrue(spanLength(problemText(TooDeep())) > 0, "TooDeep");
+        assertTrue(spanLength(problemText(TooManyTerms())) > 0, "TooManyTerms");
+        assertTrue(spanLength(problemText(UnexpectedByte())) > 0, "UnexpectedByte");
+        assertTrue(spanLength(problemText(UnclosedQuote())) > 0, "UnclosedQuote");
+        assertTrue(spanLength(problemText(UnclosedParenthesis())) > 0, "UnclosedParenthesis");
+        assertTrue(spanLength(problemText(ExpectedTerm())) > 0, "ExpectedTerm");
+        assertTrue(spanLength(problemText(ExpectedOperator())) > 0, "ExpectedOperator");
+        assertTrue(spanLength(problemText(UnquotedWord())) > 0, "UnquotedWord");
+        assertTrue(spanLength(problemText(UnknownQueryField())) > 0, "UnknownQueryField");
+        assertTrue(spanLength(problemText(BadValue())) > 0, "BadValue");
+        assertTrue(spanLength(problemText(BadTime())) > 0, "BadTime");
+        assertTrue(spanLength(problemText(BadRange())) > 0, "BadRange");
+        assertTrue(spanLength(problemText(TooManyWords())) > 0, "TooManyWords");
+        assertTrue(spanLength(problemText(TooManyTexts())) > 0, "TooManyTexts");
+        return nil;
+    end;
+
+    generic [T: Region]
+    function holds(text: Span[Nat8, T], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        if not contains(text, part) then
+            printLn(text);
+        end if;
+        assertTrue(contains(text, part), message);
+        return nil;
+    end;
+
+    function testForms(): Unit is
+        let top: String := dashboardTop("host:\"a\" <x>", "t0k\"en");
+        holds(asSpan(&top), "value=\"host:&#34;a&#34; &lt;x&gt;\"", "the query escaped in the field");
+        holds(asSpan(&top), "name=\"csrf\" value=\"t0k&#34;en\"", "the token escaped");
+        holds(asSpan(&top), "action=\"/logout\"", "the form to log out");
+        assertFalse(contains(asSpan(&top), "href=\"/totp\""), "no way to a second factor of ROXIE: RAMBO has its own");
+        destroyString(top);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function keep(db: &![Database[Writing], R], host: Span[Nat8, Static], at: Int64, level: Span[Nat8, Static],
+                  line: Span[Nat8, Static]): Unit is
+        case keepLine(&~db, host, "/var/log/app.log", at, level, line) of
+            when Right(right as kept: Option[Int64]) do
+                case kept of
+                    when Some(value as id: Int64) do
+                        assertTrue(true, "a line kept");
+                    when None do
+                        assertTrue(false, "a line kept");
+                end case;
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "a line kept");
+        end case;
+        return nil;
+    end;
+
+    -- The page of the search text from offset holds part and not unwanted.
+    generic [R: Region]
+    function page(db: &![Database[Writing], R], text: Span[Nat8, Static], offset: Int64, part: Span[Nat8, Static],
+                  unwanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case searchPage(&~db, text, offset, now, "tok") of
+            when Right(right as made: String) do
+                let fit: Bool := contains(asSpan(&made), part) and (not contains(asSpan(&made), unwanted));
+                if not fit then
+                    printLn(asSpan(&made));
+                end if;
+                assertTrue(fit, message);
+                destroyString(made);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        keep(&~db, "server", 1792000000, "error", "mariadb: table <script>alert(1)</script> full");
+        keep(&~db, "server", 1792000100, "info", "mariadb started");
+        keep(&~db, "web1.example.org", 1792000200, "error", "disk full");
+        page(&~db, "host:server and level:error", 0, "1 lines, 1 to 1 shown", "disk full", "the line of the query");
+        page(&~db, "host:server and level:error", 0, "table &lt;script&gt;alert(1)&lt;/script&gt; full", "<script>", "a line escaped");
+        page(&~db, "host:server and level:error", 0, "<td>server</td><td>error</td><td>/var/log/app.log</td>", "older</a>", "the fields of the line");
+        page(&~db, "host:server and level:error", 0, "datetime=\"2026-10-14T17:46:40Z\"", "newer</a>", "the time of the line");
+        page(&~db, "\"mariadb\"", 0, "2 lines, 1 to 2 shown", "disk full", "a word");
+        page(&~db, "level:ERROR", 0, "a value the field does not take, at byte 6", "<table", "a value refused");
+        page(&~db, "level:ERROR", 0, "<code>level:<mark>ERROR</mark></code>", "lines,", "the byte marked");
+        page(&~db, "", 0, "action=\"/search\"", "<table", "no query, no search");
+        page(&~db, "", 0, "action=\"/search\"", "roxie-problem", "no query is no problem");
+        page(&~db, "host:server and level:error", 0, " full</code></td></tr>", "full\n</code>", "the line end of a line is cut");
+        page(&~db, "host:nobody.example.org", 0, "0 lines", "<tr class=", "nothing found");
+        var i: Int64 := 0;
+        while i < 120 do
+            keep(&~db, "many.example.org", i + 1792001000, "info", "one of many");
+            i := i + 1;
+        end while;
+        page(&~db, "host:many.example.org", 0, "120 lines, 1 to 50 shown", "newer</a>", "the first page");
+        page(&~db, "host:many.example.org", 0, "offset=50\">older</a>", "offset=0", "a link to the next page");
+        page(&~db, "host:many.example.org", 50, "offset=0\">newer</a>", "51 to 99", "the page between");
+        page(&~db, "host:many.example.org", 50, "offset=100\">older</a>", "1 to 50 shown", "and on");
+        page(&~db, "host:many.example.org", 100, "101 to 120 shown", "older</a>", "the last page");
+        page(&~db, "host:many.example.org", 0, "q=host%3amany.example.org", "q=host:many", "the query escaped in a link");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function keepFrom(db: &![Database[Writing], R], host: Span[Nat8, Static], source: Span[Nat8, Static], at: Int64,
+                      level: Span[Nat8, Static]): Unit is
+        case keepLine(&~db, host, source, at, level, "a line") of
+            when Right(right as kept: Option[Int64]) do
+                case kept of
+                    when Some(value as id: Int64) do
+                        assertTrue(true, "a line kept");
+                    when None do
+                        assertTrue(false, "a line kept");
+                end case;
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "a line kept");
+        end case;
+        return nil;
+    end;
+
+    -- How often part stands in text.
+    generic [T: Region]
+    function countOf(text: Span[Nat8, T], part: Span[Nat8, Static]): Index is
+        var count: Index := 0;
+        var at: Index := 0;
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(part);
+        while (at + wanted) <= size do
+            var i: Index := 0;
+            while (i < wanted) and (text[at + i] = part[i]) do
+                i := i + 1;
+            end while;
+            if i = wanted then
+                count := count + 1;
+            end if;
+            at := at + 1;
+        end while;
+        return count;
+    end;
+
+    -- The panels of the hosts hold part count times.
+    generic [R: Region]
+    function hostsHold(db: &![Database[Writing], R], part: Span[Nat8, Static], count: Index, message: Span[Nat8, Static]): Unit is
+        case hostsPanel(&~db, now, 60) of
+            when Right(right as made: String) do
+                let fit: Bool := countOf(asSpan(&made), part) = count;
+                if not fit then
+                    printLn(asSpan(&made));
+                end if;
+                assertTrue(fit, message);
+                destroyString(made);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exerciseHosts(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareIngest(&~db), "the tables");
+        hostsHold(&~db, "No lines in the last 24 hours.", 1, "no lines, no host");
+        hostsHold(&~db, "id=\"panel-hosts\" hx-get=\"/panel/hosts\" hx-trigger=\"every 60s\" hx-swap=\"outerHTML\"", 1, "it asks for itself again");
+        keepFrom(&~db, "old.example.org", "/var/log/syslog", now - 86401, "error");
+        hostsHold(&~db, "No lines in the last 24 hours.", 1, "a line older than 24 hours does not count");
+        keepFrom(&~db, "server", "/var/log/syslog", now - 86400, "error");
+        keepFrom(&~db, "server", "/var/log/syslog", now - 10, "warn");
+        keepFrom(&~db, "server", "/var/log/syslog", now - 20, "info");
+        keepFrom(&~db, "server", "/var/log/hiawatha/access.log", now - 30, "info");
+        keepFrom(&~db, "server", "/var/log/hiawatha/access.log", now - 40, "info");
+        keepFrom(&~db, "web1.example.org", "/var/log/<x>.log", now - 50, "error");
+        hostsHold(&~db, "No lines", 0, "lines, so hosts");
+        hostsHold(&~db, ">old.example.org<", 0, "the host with an old line only is not there");
+        hostsHold(&~db, "<section class=\"wolly-panel roxie-host\">", 2, "a section for each host");
+        hostsHold(&~db, "</section>", 2, "each closed");
+        hostsHold(&~db, "<h2>server</h2>", 1, "server");
+        hostsHold(&~db, "<h2>web1.example.org</h2>", 1, "web1");
+        hostsHold(&~db, ">5 lines</a>, ", 1, "the lines of server, the line of 24 hours ago taken");
+        hostsHold(&~db, ">1 errors</a>, ", 2, "an error of each host");
+        hostsHold(&~db, ">1 warnings</a> in 24 hours", 1, "a warning of server");
+        hostsHold(&~db, ">0 warnings</a> in 24 hours", 1, "none of web1");
+        hostsHold(&~db, "<tr><td>/var/log/hiawatha/access.log</td><td><a href=\"/search?q=host%3a%22atarax%22%20and%20source%3a%22%2fvar%2flog%2fhiawatha%2faccess.log%22%20and%20time%3alast%2024h\">2</a></td>", 1, "a source, its lines and the link of its search");
+        hostsHold(&~db, "<tr><td>/var/log/syslog</td><td><a href=\"/search?q=host%3a%22atarax%22%20and%20source%3a%22%2fvar%2flog%2fsyslog%22%20and%20time%3alast%2024h\">3</a></td>", 1, "the sources of a host in order");
+        hostsHold(&~db, "%20and%20time%3alast%2024h%20and%20level%3Aerror\">1</a></td>", 2, "errors of syslog and of x");
+        hostsHold(&~db, "<td>/var/log/&lt;x&gt;.log</td>", 1, "a source escaped");
+        hostsHold(&~db, "</time></td></tr>\n<tr><td>/var/log/syslog</td>", 1, "the second source of server in its section, after the first");
+        hostsHold(&~db, "</section>\n<section class=\"wolly-panel roxie-host\">\n<h2>web1.example.org</h2>", 1, "web1 after server");
+        hostsHold(&~db, "<time datetime=\"2026-10-14T23:59:50Z\">", 1, "the last line of syslog");
+        hostsHold(&~db, "<a href=\"/search?q=host%3a%22web1.example.org%22%20and%20time%3alast%2024h\">1 lines</a>", 1, "the search of a host");
+        page(&~db, "host:\"server\" and source:\"/var/log/syslog\" and time:last 24h and level:warn", 0, "1 lines, 1 to 1 shown", "roxie-problem", "the query of a link is one Wolly.Query runs");
+        return nil;
+    end;
+
+    -- The foot of version holds shown, the words and the holder.
+    generic [V: Region]
+    function footHolds(version: Span[Nat8, V], shown: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let foot: String := footerOf(version);
+        holds(asSpan(&foot), shown, message);
+        holds(asSpan(&foot), " - Ranked Objects eXtended Index Engine - (c) 2026 <a href=\"https://www.heiko-zimmermann.com/\" target=\"_blank\" rel=\"noopener noreferrer\">Heiko Zimmermann</a></footer>", message);
+        holds(asSpan(&foot), "<footer class=\"site-foot\">", message);
+        destroyString(foot);
+        return nil;
+    end;
+
+    -- whole with foot is wanted.
+    generic [P: Region]
+    function withFootIs(whole: Span[Nat8, P], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := withFooter(whole, "<f>");
+        if not equal(asSpan(&made), wanted) then
+            printLn(asSpan(&made));
+        end if;
+        assertTrue(equal(asSpan(&made), wanted), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function testFooter(): Unit is
+        footHolds("v9.8.7-3-gabcdef1", "ROXIE v9.8.7 - ", "the number of the tag, after commits since it");
+        let after: String := footerOf("v9.8.7-3-gabcdef1");
+        assertFalse(contains(asSpan(&after), "gabcdef1"), "not the commits after the tag");
+        destroyString(after);
+        footHolds("v0.1.0", "ROXIE v0.1.0 - ", "a tag");
+        footHolds("0.2.0", "ROXIE v0.2.0 - ", "a number without its v gets one");
+        footHolds("", "ROXIE dev - ", "no version: dev");
+        footHolds("v", "ROXIE dev - ", "a v alone: dev");
+        footHolds("vx1", "ROXIE dev - ", "no digit after the v: dev");
+        footHolds("v1<script>", "ROXIE dev - ", "a byte no version holds: dev");
+        let odd: String := footerOf("v1\"><script>");
+        assertFalse(contains(asSpan(&odd), "<script"), "nothing of an odd version in the page");
+        destroyString(odd);
+        let built: String := footer();
+        holds(asSpan(&built), "ROXIE dev - ", "a test is built without a version: dev");
+        destroyString(built);
+        withFootIs("<body><p>a</p></body></html>", "<body><p>a</p><f></body></html>", "the foot before the end of the body");
+        withFootIs("<div>a panel</div>", "<div>a panel</div>", "a part of a page as it is");
+        withFootIs("<body></body><body></body>", "<body><f></body><body></body>", "before the first end");
+        withFootIs("</body>", "<f></body>", "at the very start");
+        return nil;
+    end;
+
+    -- Every problem a query can have is named on the page of help in the
+    -- words the page of a search shows.
+    generic [T: Region]
+    function namesProblem(text: Span[Nat8, T], problem: QueryProblem, message: Span[Nat8, Static]): Unit is
+        holds(text, problemText(problem), message);
+        return nil;
+    end;
+
+    function testHelp(): Unit is
+        let help: String := helpPage(1792022400, "t0k\"en");
+        holds(asSpan(&help), "<title>ROXIE: help</title>", "the title");
+        holds(asSpan(&help), "datetime=\"2026-10-15T00:00:00Z\"", "the time of the page");
+        holds(asSpan(&help), "name=\"csrf\" value=\"t0k&#34;en\"", "the head with the token escaped");
+        holds(asSpan(&help), "<input id=\"q\" name=\"q\" type=\"search\" value=\"\"", "an empty search field");
+        holds(asSpan(&help), "<a class=\"roxie-help-link\" href=\"/help\">Help</a>", "the link to itself in the head");
+        holds(asSpan(&help), "<td><code>host:NAME</code></td>", "the field host");
+        holds(asSpan(&help), "<td><code>source:PATH</code></td>", "the field source");
+        holds(asSpan(&help), "<td><code>level:LEVEL</code></td>", "the field level");
+        holds(asSpan(&help), "<td><code>id:N</code></td>", "the field id");
+        holds(asSpan(&help), "<td><code>time:last N</code> and a unit</td>", "the window up to now");
+        holds(asSpan(&help), "<td><code>FIELD:[A .. B]</code></td>", "a range");
+        holds(asSpan(&help), "<td><code>\"WORDS\"</code></td>", "text in quotes");
+        holds(asSpan(&help), "<a href=\"/search?q=%28host%3Aweb1.example.org%20or%20host%3Aatarax%29%20and%20level%3Aerror\">", "an example as the link of its search");
+        namesProblem(asSpan(&help), QueryTooLong(), "QueryTooLong");
+        namesProblem(asSpan(&help), NoQuery(), "NoQuery");
+        namesProblem(asSpan(&help), TooDeep(), "TooDeep");
+        namesProblem(asSpan(&help), TooManyTerms(), "TooManyTerms");
+        namesProblem(asSpan(&help), UnexpectedByte(), "UnexpectedByte");
+        namesProblem(asSpan(&help), UnclosedQuote(), "UnclosedQuote");
+        namesProblem(asSpan(&help), UnclosedParenthesis(), "UnclosedParenthesis");
+        namesProblem(asSpan(&help), ExpectedTerm(), "ExpectedTerm");
+        namesProblem(asSpan(&help), ExpectedOperator(), "ExpectedOperator");
+        namesProblem(asSpan(&help), UnquotedWord(), "UnquotedWord");
+        namesProblem(asSpan(&help), UnknownQueryField(), "UnknownQueryField");
+        namesProblem(asSpan(&help), BadValue(), "BadValue");
+        namesProblem(asSpan(&help), BadTime(), "BadTime");
+        namesProblem(asSpan(&help), BadRange(), "BadRange");
+        namesProblem(asSpan(&help), TooManyWords(), "TooManyWords");
+        namesProblem(asSpan(&help), TooManyTexts(), "TooManyTexts");
+        holds(asSpan(&help), "more lines in the time window than a search looks at; add time:last 24h", "too many lines");
+        assertFalse(contains(asSpan(&help), "{{"), "nothing of the template left");
+        destroyString(help);
+        return nil;
+    end;
+
+    function testHosts(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseHosts(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testSearch(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

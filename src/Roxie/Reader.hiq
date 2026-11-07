@@ -1,0 +1,222 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    startsWith
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Bearer (
+    bearerToken,
+    tokenOwner,
+    unauthorized
+);
+import Wolly.Request (
+    requestMethod,
+    query
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish as respond
+);
+import Roxie.Find (
+    defaultShown,
+    mostShown,
+    answerQuery
+);
+
+module body Roxie.Reader is
+    constant prefix: Span[Nat8, Static] := "_reader.";
+    constant most_name_bytes: Index := 56;
+
+    generic [N: Region]
+    function readerOwner(name: Span[Nat8, N]): Option[String] is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > most_name_bytes) then
+            return None();
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let b: Nat8 := name[i];
+            let small: Bool := (b >= 'a') and (b <= 'z');
+            let digit: Bool := (b >= '0') and (b <= '9');
+            if not ((small or digit) or (b = '-')) then
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, prefix);
+        writeString(&!out, name);
+        return Some(value => finalize(out));
+    end;
+
+    generic [O: Region]
+    function isReader(owner: Span[Nat8, O]): Bool is
+        if spanLength(owner) <= spanLength(prefix) then
+            return false;
+        end if;
+        return startsWith(owner, prefix);
+    end;
+
+    function plain(status: Nat16): Response is
+        return addHeader(makeResponse(status, "text/plain; charset=utf-8"), "Cache-Control", "no-store");
+    end;
+
+    generic [V: Region]
+    function isGet(verb: Span[Nat8, V]): Bool is
+        if spanLength(verb) /= 3 then
+            return false;
+        end if;
+        return ((verb[0] = 'G') and (verb[1] = 'E')) and (verb[2] = 'T');
+    end;
+
+    -- The lines of limit: 1 to 3 digits, 1 to 100; None for anything else.
+    generic [L: Region]
+    function limitOf(text: Span[Nat8, L]): Option[Int64] is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > 3) then
+            return None();
+        end if;
+        var total: Int64 := 0;
+        var i: Index := 0;
+        while i < size do
+            let b: Nat8 := text[i];
+            if (b < '0') or (b > '9') then
+                return None();
+            end if;
+            case toInt64(b - '0') of
+                when Some(value as digit: Int64) do
+                    total := (total * 10) + digit;
+                when None do
+                    return None();
+            end case;
+            i := i + 1;
+        end while;
+        if (total < 1) or (total > mostShown()) then
+            return None();
+        end if;
+        return Some(value => total);
+    end;
+
+    -- The HTTP status of an answer of Roxie.Find: it ran (0, 1), refused
+    -- (2, 3), the store not read (4).
+    function statusOf(status: Int32): Nat16 is
+        if status <= 1 then
+            return 200;
+        end if;
+        if status <= 3 then
+            return 400;
+        end if;
+        return 503;
+    end;
+
+    generic [R: Region, Q: Region, V: Region]
+    function asked(db: &![Database[Writing], R], request: &[Request, Q], now: Int64, version: Span[Nat8, V]): String is
+        var limit: Int64 := defaultShown();
+        case query(request, "limit") of
+            when Some(value as given: String) do
+                let parsed: Option[Int64] := limitOf(asSpan(&given));
+                destroyString(given);
+                case parsed of
+                    when Some(value as lines: Int64) do
+                        limit := lines;
+                    when None do
+                        return respond(plain(400), "limit is 1 to 100\n");
+                end case;
+            when None do
+                skip;
+        end case;
+        var since: String := fromSpan("");
+        case query(request, "since") of
+            when Some(value as given: String) do
+                destroyString(since);
+                since := given;
+            when None do
+                skip;
+        end case;
+        case query(request, "q") of
+            when Some(value as text: String) do
+                var answer: String := fromSpan("");
+                borrow t: &[String, T] := &text do
+                    borrow w: &[String, W] := &since do
+                        let { status as s: Int32, out as out: String, err as err: String } := answerQuery(&~db, asSpan(t), asSpan(w), now,
+                                                                                                          limit, true, false, version);
+                        destroyString(err);
+                        let json: Response := addHeader(makeResponse(statusOf(s), "application/json"), "Cache-Control", "no-store");
+                        destroyString(answer);
+                        answer := respond(json, asSpan(&out));
+                        destroyString(out);
+                    end borrow;
+                end borrow;
+                destroyString(text);
+                destroyString(since);
+                return answer;
+            when None do
+                destroyString(since);
+                return respond(plain(400), "q is missing\n");
+        end case;
+    end;
+
+    generic [R: Region, Q: Region, V: Region]
+    function answerReader(db: &![Database[Writing], R], request: &[Request, Q], now: Int64,
+                          version: Span[Nat8, V]): String is
+        var get: Bool := false;
+        case requestMethod(request) of
+            when Some(value as verb: String) do
+                get := isGet(asSpan(&verb));
+                destroyString(verb);
+            when None do
+                skip;
+        end case;
+        if not get then
+            return respond(addHeader(plain(405), "Allow", "GET"), "only GET\n");
+        end if;
+        case bearerToken(request) of
+            when None do
+                return unauthorized();
+            when Some(value as token: String) do
+                let owner: Either[DbError, Option[String]] := tokenOwner(&~db, asSpan(&token));
+                destroyString(token);
+                case owner of
+                    when Left(left as error: DbError) do
+                        return respond(plain(503), "storage\n");
+                    when Right(right as found: Option[String]) do
+                        case found of
+                            when None do
+                                return unauthorized();
+                            when Some(value as name: String) do
+                                let reader: Bool := isReader(asSpan(&name));
+                                destroyString(name);
+                                if not reader then
+                                    return respond(plain(403), "the token is no reader's\n");
+                                end if;
+                                return asked(&~db, request, now, version);
+                        end case;
+                end case;
+        end case;
+    end;
+end module body.

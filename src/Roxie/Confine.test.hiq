@@ -1,0 +1,79 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The policy of an agent: its promises, the directories of
+-- the files of its configuration to read, each once, the directory of
+-- its state to write, and nothing more; the root is never granted.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.Sandbox (
+    Policy,
+    describePaths,
+    policyValid,
+    policyPathCount,
+    discardPolicy
+);
+import Roxie.Config (
+    ConfigError,
+    AgentConfig,
+    readConfig,
+    destroyConfig
+);
+import Roxie.Confine (
+    agentPromises,
+    agentPolicy
+);
+
+module body Roxie.Confine.Test is
+    constant at_directory: Span[Nat8, Static] := "collector https://192.0.2.7:8445/ingest\nca /etc/roxie-agent/ca.pem\ncertificate /etc/roxie-agent/agent.pem\nkey /etc/roxie-agent/agent.key\ntoken /etc/roxie-agent/token\nstate /var/db/roxie-agent/agent.db\nevery 10\nfile /var/log/hiawatha/access.log\nfile /var/log/hiawatha/error.log\n";
+
+    constant at_directory_paths: Span[Nat8, Static] := "/etc/roxie-agent/ca.pem r\n/etc/roxie-agent/agent.pem r\n/etc/roxie-agent/agent.key r\n/var/log/hiawatha r\n/var/db/roxie-agent rwc\n/etc/resolv.conf r\n/etc/hosts r\n";
+
+    constant root_state: Span[Nat8, Static] := "collector https://192.0.2.7:8445/ingest\nca /etc/roxie-agent/ca.pem\ncertificate /etc/roxie-agent/agent.pem\nkey /etc/roxie-agent/agent.key\ntoken /etc/roxie-agent/token\nstate /agent.db\nevery 10\nfile /var/log/messages\nfile /lonely.log\n";
+
+    constant root_state_paths: Span[Nat8, Static] := "/etc/roxie-agent/ca.pem r\n/etc/roxie-agent/agent.pem r\n/etc/roxie-agent/agent.key r\n/var/log r\n/etc/resolv.conf r\n/etc/hosts r\n";
+
+    generic [T: Region]
+    function policyIs(text: Span[Nat8, T], paths: Span[Nat8, Static], count: Index, message: Span[Nat8, Static]): Unit is
+        case readConfig(text) of
+            when Left(left as error: ConfigError) do
+                assertTrue(false, message);
+            when Right(right as config: AgentConfig) do
+                let policy: Policy := agentPolicy(&config);
+                let described: String := describePaths(&policy);
+                assertTrue(policyValid(&policy), "the policy is valid");
+                assertTrue(policyPathCount(&policy) = count, "the number of paths");
+                if not equal(asSpan(&described), paths) then
+                    printLn(asSpan(&described));
+                end if;
+                assertTrue(equal(asSpan(&described), paths), message);
+                destroyString(described);
+                discardPolicy(policy);
+                destroyConfig(config);
+        end case;
+        return nil;
+    end;
+
+    function testPromises(): Unit is
+        assertTrue(equal(agentPromises(), "stdio rpath wpath cpath flock inet dns"), "the promises of an agent");
+        return nil;
+    end;
+
+    function testPolicy(): Unit is
+        policyIs(at_directory, at_directory_paths, 7, "the directory of two files once, the state's directory to write");
+        policyIs(root_state, root_state_paths, 6, "a state and a file directly under the root: the root is not granted");
+        return nil;
+    end;
+end module body.

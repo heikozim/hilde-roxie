@@ -1,0 +1,17 @@
+ROXIE
+Copyright 2026 Heiko Zimmermann
+Apache-2.0 WITH LLVM-exception, as Wolly and Hilde.
+
+ROXIE carries one file of another project:
+
+share/htmx.min.js -- htmx 2.0.10
+  from:     https://github.com/bigskysoftware/htmx, release v2.0.10
+            (tag commit bdc7d7d3e25d0390c7ee11049806e8279b075598),
+            dist/htmx.min.js
+  sha256:   71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de
+            (the same as the digest GitHub gives for the release asset
+            htmx.min.js of v2.0.10, fetched 2026-10-16)
+  version:  the file names itself version:"2.0.10"
+  licence:  Zero-Clause BSD, its text in share/htmx-LICENSE.txt, the
+            LICENSE of the repository at that tag
+            (sha256 d3d2456f76414f2456104660ebd65aff1c04cd7966b942bdabd63f3cdb316a38)

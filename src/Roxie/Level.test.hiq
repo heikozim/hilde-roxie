@@ -1,0 +1,81 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The level guessed from real lines of syslog, nginx, MariaDB and Hiawatha,
+-- and from the edges of a word; counts of nothing.
+import Standard.Testing (
+    assertTrue
+);
+import Roxie.Level (
+    guessLevel
+);
+
+module body Roxie.Level.Test is
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function guessed(text: Span[Nat8, Static], level: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let found: Span[Nat8, Static] := guessLevel(text);
+        if not equal(found, level) then
+            printLn(found);
+        end if;
+        assertTrue(equal(found, level), message);
+        return nil;
+    end;
+
+    function testLines(): Unit is
+        guessed("Oct 15 18:20:01 server systemd[1]: Started Session 42 of user admin.", "info", "a plain line");
+        guessed("2026-10-15 18:20:01 3 [ERROR] mysqld: Table './app/users' is marked as crashed", "error", "MariaDB in capitals");
+        guessed("2026/10/15 18:20:01 [warn] 123#0: *1 an upstream response is buffered", "warn", "nginx warn");
+        guessed("kernel: [ 12.3] EXT4-fs warning (device sda1): ext4_dx_add_entry", "warn", "a kernel warning");
+        guessed("sshd[99]: Failed password for root from 203.0.113.9 port 22", "error", "Failed at the start of a word");
+        guessed("warning: something failed", "error", "the most severe word wins");
+        guessed("DEBUG cache hit for key x", "debug", "debug");
+        guessed("trace: enter handler", "debug", "trace");
+        guessed("process exited with code 0, no errors", "error", "errors counts, even after no");
+        guessed("terror in the logs", "info", "a word that holds error is no error");
+        guessed("errorless run", "info", "nor one that begins with it");
+        guessed("PANIC", "error", "a word alone");
+        guessed("ends with error", "error", "a word at the end");
+        guessed("", "info", "nothing");
+        guessed("!!! ### ---", "info", "no word");
+        guessed("emergencyexit opened", "info", "a word longer than any of the levels");
+        guessed("x-error-y", "error", "words between hyphens");
+        return nil;
+    end;
+
+    --: a word that counts nothing.
+    function testZero(): Unit is
+        guessed("0 asked, 0 refused, 0 failed, 0 unknown", "info", "0 failed");
+        guessed("0 failed", "info", "0 at the start");
+        guessed("10 failed", "error", "10 failed");
+        guessed("x0 failed", "error", "a word that ends in 0 is no count");
+        guessed("0-failed", "error", "no space between");
+        guessed("failed: 0", "info", "failed: 0");
+        guessed("failed:      0", "info", "failed: and spaces");
+        guessed("errors=0 warnings=0", "info", "errors=0");
+        guessed("failed: 0.5", "error", "0.5 is not 0");
+        guessed("failed: 01", "error", "01 is not 0");
+        guessed("failed: 2", "error", "two failed");
+        guessed("failed:", "error", "nothing after the colon");
+        guessed("failed 0", "error", "a count after a space is not read");
+        guessed("0 warnings, 1 error", "error", "a count of one");
+        guessed("0 errors, 3 warnings", "warn", "warnings counted, errors not");
+        return nil;
+    end;
+end module body.

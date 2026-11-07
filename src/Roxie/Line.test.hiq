@@ -1,0 +1,277 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Time and level from real lines of server, the seconds
+-- computed apart by Python's datetime.fromisoformat.
+import Standard.Calendar (
+    Zone,
+    ZoneFailure,
+    zoneOfRule,
+    utcZone,
+    destroyZone
+);
+import Standard.Testing (
+    assertTrue
+);
+import Roxie.Line (
+    parseLineTime,
+    lineTime,
+    lineLevel
+);
+
+module body Roxie.Line.Test is
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function timeIs(text: Span[Nat8, Static], seconds: Int64, message: Span[Nat8, Static]): Unit is
+        case parseLineTime(text) of
+            when Some(value as found: Int64) do
+                if found /= seconds then
+                    printLn(found);
+                end if;
+                assertTrue(found = seconds, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function noTime(text: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case parseLineTime(text) of
+            when Some(value as found: Int64) do
+                printLn(found);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function levelIs(text: Span[Nat8, Static], level: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let found: Span[Nat8, Static] := lineLevel(text);
+        if not equal(found, level) then
+            printLn(found);
+        end if;
+        assertTrue(equal(found, level), message);
+        return nil;
+    end;
+
+    function testSyslog(): Unit is
+        timeIs("2026-10-16T15:55:41.209004+02:00 server systemd[1]: tweety-ask.service: Deactivated successfully.", 1792158941, "syslog of server, with a fraction and an offset");
+        timeIs("2026-10-16T13:55:41Z server kernel: x", 1792158941, "Z is the same instant");
+        timeIs("2024-02-29T23:59:59-05:30 h p: leap day, an offset west", 1709270999, "a leap day and a negative offset");
+        timeIs("1970-01-01T00:00:00Z h p: the start", 0, "the start of the count");
+        noTime("2026-02-30T10:00:00Z h p: no such day", "a day that does not exist");
+        noTime("2026-10-16T15:55:41 h p: no offset", "no zone");
+        noTime("2026-10-16T15:55:60Z h p: a leap second", "second 60");
+        noTime("Oct 16 15:55:41 server sshd[1]: the old syslog form", "the old form of syslog has no year: not read");
+        noTime("2026-10-16T15:55:41Z", "no space after it: not a line of syslog");
+        return nil;
+    end;
+
+    function testHiawatha(): Unit is
+        timeIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|200|502|GET /dialog?note=pushqueued HTTP/2.0|https://audit", 1792007209, "an access line of audit");
+        timeIs("0.0.0.0|Fri 16 Oct 2026 12:29:45 +0200|Hiawatha v13.0 started.", 1792146585, "system.log");
+        timeIs("127.0.0.1|Thu 01 Jan 2026 00:30:00 +0100|error while sending data to FastCGI server", 1767223800, "the year before in UTC");
+        timeIs("2001:db8:0:0:0:0:0:1|Thu 01 Jan 2026 00:30:00 +0100|x", 1767223800, "an IPv6 address");
+        timeIs("1|Thu 01 Jan 2026 00:30:00 +0100|x", 1767223800, "a short address");
+        timeIs("1|Thu 29 Feb 2024 23:59:59 -0530|x", 1709270999, "a leap day and an offset west");
+        noTime("1|Thu 01 Jan 202X 00:30:00 +0100|x", "a letter in the year, which would make 2060");
+        noTime("203.0.113.62|Wed 14 Okt 2026 21:46:49 +0200|200|1|GET /", "a month not in English");
+        noTime("203.0.113.62|Wed 31 Feb 2026 21:46:49 +0200|200|1|GET /", "a day the month does not have");
+        noTime("203.0.113.62|Wed 14 Oct 2026 21:46:49 *0200|200|1|GET /", "no sign before the offset");
+        noTime("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200 200|1|GET /", "no bar after the date");
+        noTime("203.0.113.62 Wed 14 Oct 2026 21:46:49 +0200|200|1|GET /", "no bar before it");
+        noTime("123456789012345678901234567890123456789012345678|Wed 14 Oct 2026 21:46:49 +0200|x", "a bar later than an address can be");
+        noTime("203.0.113.62|Wed 14 Oct 2026", "a line cut in the date");
+        noTime("", "nothing");
+        noTime("a line without a time", "no time");
+        return nil;
+    end;
+
+    function testLineTime(): Unit is
+        let zone: Zone := utcZone();
+        assertTrue(lineTime("2026-10-16T13:55:41Z h p: x", &zone, 1792160000) = 1792158941, "a time before now is taken");
+        assertTrue(lineTime("2026-10-16T13:55:41Z h p: x", &zone, 1792158941) = 1792158941, "a time equal to now is taken");
+        assertTrue(lineTime("2026-10-16T13:55:41Z h p: x", &zone, 1792158940) = 1792158940, "a time after now is not: the collector would refuse it");
+        assertTrue(lineTime("1969-12-31T23:59:59Z h p: x", &zone, 1792160000) = 1792160000, "a time before 1970 is not");
+        assertTrue(lineTime("no time here", &zone, 1792160000) = 1792160000, "no time: now");
+        destroyZone(zone);
+        return nil;
+    end;
+
+    function testLevel(): Unit is
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|200|502|GET /error/page HTTP/2.0|https://x", "info", "200 is info, the word error in the path does not count");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|404|10|GET / HTTP/2.0|-", "warn", "404 is warn");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|499|10|GET / HTTP/2.0|-", "warn", "499 is warn");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|500|10|GET / HTTP/2.0|-", "error", "500 is error");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|503|10|GET / HTTP/2.0|-", "error", "503 is error");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|399|10|GET / HTTP/2.0|-", "info", "399 is info");
+        levelIs("127.0.0.1|Sat 10 Oct 2026 11:19:07 +0200|error while sending data to FastCGI server", "error", "an error line of Hiawatha by its words");
+        levelIs("0.0.0.0|Fri 16 Oct 2026 12:29:45 +0200|Hiawatha v13.0 started.", "info", "system.log by its words");
+        levelIs("192.0.2.1|Fri 25 Sep 2026 14:51:32 +0200|/var/www/tweety/sources|CGI application timeout", "info", "no status after the date: words");
+        levelIs("2026-10-16T15:55:41.209004+02:00 server kernel: EXT4-fs warning (device sda1)", "warn", "syslog by its words");
+        levelIs("2026-10-22T11:43:09.770067+02:00 server systemd[1648]: Finished audit-alert.service - APP ALERT (put the job API's alarms into the WhatsApp outbox).", "info", "a job of systemd finished: the words of its description are no level");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1648]: Starting audit-alert.service - APP ALERT (put the job API's alarms into the WhatsApp outbox)...", "info", "a job of systemd starting");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Started fail2ban.service - Fail2Ban Service.", "info", "started");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Stopping warn-mail.service - warn by mail...", "info", "stopping");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Stopped error-mail.service - error by mail.", "info", "stopped");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Reloading hiawatha.service - fatal reload...", "info", "reloading");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Reloaded hiawatha.service - fatal reload.", "info", "reloaded");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Failed to start audit-alert.service - APP ALERT.", "error", "a job that failed is still an error");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: audit-alert.service: Failed with result 'exit-code'.", "error", "a result that failed is still an error");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: Finishedx error", "error", "a verb only with its space");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server notsystemd[1]: Finished x - an error", "error", "another program with the verb");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server cron[1]: systemd[1]: Finished x - an error", "error", "systemd only as the program");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1] Finished x - an error", "error", "systemd without its colon");
+        levelIs("Finished x - an error", "error", "the verb in a line that is no syslog");
+        levelIs("<11>2026-10-22T11:43:09+02:00 server systemd[1]: Started x.", "error", "a priority before goes first");
+        levelIs("2026-10-22T11:43:09.662632+02:00 server systemd[1]: ", "info", "systemd with no message");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|50|10|GET /", "info", "two digits are no status");
+        return nil;
+    end;
+
+    --: the "level" of a JSON line, as Audit and Tweety write it into
+    -- syslog (server: 45676 of 213306 lines carry one).
+    function testJsonLevel(): Unit is
+        levelIs("2026-10-17T11:09:25.631236+02:00 server audit-api[1476]: {\"time\":\"2026-10-17T11:09:25.630887973+02:00\",\"level\":\"INFO\",\"msg\":\"audit\",\"op\":\"llm-call\",\"result\":\"ok\",\"error_class\":\"\"}", "info", "INFO is info, error_class is no error");
+        levelIs("2026-10-17T11:09:25+02:00 server audit-api[1476]: {\"level\":\"WARN\",\"msg\":\"slow\"}", "warn", "WARN is warn");
+        levelIs("2026-10-17T11:09:25+02:00 server audit-api[1476]: {\"level\":\"ERROR\",\"msg\":\"upstream gone\"}", "error", "ERROR is error");
+        levelIs("x {\"level\":\"debug\",\"msg\":\"failed nothing\"}", "debug", "debug in small letters, a word of error in it");
+        levelIs("x {\"level\":\"warning\",\"msg\":\"a job failed\"}", "warn", "warning, a word of error beside it");
+        levelIs("x {\"level\":\"fatal\"}", "error", "fatal");
+        levelIs("x {\"level\":\"LOUD\",\"msg\":\"disk failed\"}", "error", "a level of another name: the words decide");
+        levelIs("x {\"level\":\"NOTICE\",\"msg\":\"disk failed\"}", "info", "NOTICE is info");
+        levelIs("x {\"level\": \"INFO\",\"msg\":\"failed\"}", "error", "a space after the colon is not read: the words decide");
+        levelIs("x failed {\"level\":\"INFO", "error", "no closing quote: the words decide");
+        levelIs("x {\"level\":\"INFO\"} then {\"level\":\"ERROR\"}", "info", "the first level counts");
+        levelIs("203.0.113.62|Wed 14 Oct 2026 21:46:49 +0200|500|10|GET /?\"level\":\"INFO\"", "error", "an access line keeps its status");
+        return nil;
+    end;
+
+    --: logfmt's level=, as Tweety, containerd and dockerd write it
+    -- into syslog (server: 13424 of 213710 lines).
+    function testLogfmtLevel(): Unit is
+        levelIs("2026-10-11T00:24:12.996227+02:00 server tweety-enrich[3620605]: time=2026-10-11T00:24:12.995+02:00 level=WARN msg=\"hypothesis: event alert raised\" op=event-alert item=465144 category=disaster severity=4", "warn", "WARN, alert in the message");
+        levelIs("2026-10-16T10:18:45.104001+02:00 server containerd[1230327]: time=\"2026-10-16T10:18:45+02:00\" level=warning msg=\"Configuration migrated from version 0, use `containerd config migrate` to avoid migration\" t=\"10.28us\"", "warn", "warning of containerd");
+        levelIs("2026-10-11T00:26:33.222260+02:00 server tweety[2735600]: time=2026-10-11T00:26:33.221+02:00 level=AUDIT msg=audit op=login who=heiko result=ok reason=rambo", "info", "AUDIT of Tweety is info");
+        levelIs("2026-10-11T00:26:33.222260+02:00 server tweety[2735600]: time=2026-10-11T00:26:33.221+02:00 level=AUDIT msg=audit op=login who=heiko result=failed", "info", "AUDIT is info, a failed login in it too (the line above with result=failed)");
+        levelIs("2026-10-11T00:17:01.281089+02:00 server dockerd-rootless.sh[2580]: time=\"2026-10-11T00:17:01.280646577+02:00\" level=error msg=\"Failed to apply performance tuning sysctls to the sandbox: operation not permitted\"", "error", "error of dockerd");
+        levelIs("2026-10-11T00:17:01.301728+02:00 server dockerd-rootless.sh[2641]: time=\"2026-10-11T00:17:01.301414791+02:00\" level=info msg=\"connecting to shim d7c06fc0\" address=\"unix:///run/containerd/s/6956ec50\"", "info", "info of dockerd");
+        levelIs("2026-10-11T08:05:44.827014+02:00 server tweety-briefing[481330]: time=2026-10-11T08:05:44.826+02:00 level=ERROR msg=\"briefing: the job failed\" op=briefing-ask class=timeout", "error", "ERROR of Tweety");
+        levelIs("x level=\"debug\" msg=failed", "debug", "a quoted value");
+        levelIs("x level=info", "info", "a value at the end of the line");
+        levelIs("x loglevel=info failed", "error", "a key that ends in level= is not read: the words decide");
+        levelIs("x level=informational failed", "error", "a value that only begins with a name: the words decide");
+        levelIs("x level=\"info failed", "error", "no closing quote: the words decide");
+        levelIs("x level=info level=error", "info", "the first level counts");
+        levelIs("level=error x", "error", "a key at the start of the line");
+        return nil;
+    end;
+
+    --: the severity of a priority at the start of the line, from
+    -- lines logger of util-linux 2.41.5 wrote on server; the
+    -- files of server carry none (0 of 213710 lines).
+    function testPriority(): Unit is
+        levelIs("<12>1 2026-10-17T11:29:23.931442+02:00 server.example.org roxie-probe - - - disk nearly full", "warn", "user.warning, RFC 5424");
+        levelIs("<27>1 2026-10-17T11:29:23.934014+02:00 server.example.org roxie-probe - - - the job failed", "error", "daemon.err");
+        levelIs("<15>Oct 17 11:29:23 server roxie-probe: cache hit", "debug", "user.debug, RFC 3164");
+        levelIs("<14>1 2026-10-17T11:29:23Z h p - - - the job failed", "info", "user.info: the priority wins over the words");
+        levelIs("<0>x", "error", "emerg");
+        levelIs("<191>x failed", "debug", "local7.debug, the highest priority");
+        levelIs("<192>x", "info", "above 191 is no priority: the words decide");
+        levelIs("<1234>x warning", "warn", "four digits are no priority");
+        levelIs("<>x warning", "warn", "no digits");
+        levelIs("<0015>x warning", "warn", "four digits that make 15 are no priority either");
+        levelIs("<13 x warning", "warn", "no closing bracket");
+        timeIs("<12>1 2026-10-17T11:29:23.931442+02:00 server.example.org roxie-probe - - - disk nearly full", 1792229363, "the time after a priority and the version");
+        timeIs("<12>2026-10-17T09:29:23Z h p: x", 1792229363, "a priority without a version");
+        noTime("<15>Oct 17 11:29:23 server roxie-probe: cache hit", "RFC 3164 after a priority has no year");
+        return nil;
+    end;
+
+    --: the words of a line of syslog are its message, and a word of
+    -- error that counts nothing is none; lines of server that
+    -- stood as error.
+    function testMessageWords(): Unit is
+        levelIs("2026-10-11T00:16:54.173965+02:00 server audit-alert[3597062]: app: token 358 days left, 0 notice(s) noted, 0 raised, 0 row(s) purged", "info", "alert in the name of the program is no word");
+        levelIs("2026-10-11T00:16:54.174051+02:00 server audit-alert[3597062]: alert: 0 pending, 0 in the outbox, 0 failed", "info", "nothing failed");
+        levelIs("2026-10-11T00:14:05.520900+02:00 server tweety-briefing[3595615]: 0 asked, 0 stored, 0 kept, 10 fresh, 0 empty, 0 refused, 0 failed, 0 unknown, 0 removed, 0 paused, 0 dropped, 0 tokens", "info", "0 failed");
+        levelIs("2026-10-11T00:22:18.510869+02:00 server tweety-hypothesis[3620440]: failed:      0", "info", "failed: and spaces and 0");
+        levelIs("2026-10-11T00:22:18Z server tweety-hypothesis[3620440]: failed:      2", "error", "two failed");
+        levelIs("2026-10-11T00:22:18Z server error-reporter[1]: all done", "info", "error in the name of a program");
+        levelIs("2026-10-11T00:22:18Z server error-reporter all failed", "error", "no colon after the program: its words count from it");
+        levelIs("2026-10-11T00:22:18Z failed", "error", "no host and no program: the words of the line");
+        return nil;
+    end;
+
+    -- The BSD form in the rule of Berlin, the zone of server and
+    -- edge; the seconds computed apart by Python's zoneinfo.
+    function berlin(): Zone is
+        case zoneOfRule("CET-1CEST,M3.5.0,M10.5.0/3") of
+            when Right(right as zone: Zone) do
+                return zone;
+            when Left(left as why: ZoneFailure) do
+                abort("Roxie.Line.Test: the rule of Berlin was refused");
+        end case;
+    end;
+
+    function bsdIs(text: Span[Nat8, Static], now: Int64, seconds: Int64, message: Span[Nat8, Static]): Unit is
+        let zone: Zone := berlin();
+        let found: Int64 := lineTime(text, &zone, now);
+        destroyZone(zone);
+        if found /= seconds then
+            printLn(found);
+        end if;
+        assertTrue(found = seconds, message);
+        return nil;
+    end;
+
+    -- 2026-10-27T12:30:00+01:00 and 2027-01-01T00:10:00+01:00.
+    function testBsdTime(): Unit is
+        let now: Int64 := 1793100600;
+        bsdIs("Oct 27 12:23:45 proxy unbound: [82488:0] notice: init module 1: iterator", now, 1793100225, "a line of edge, in winter time");
+        bsdIs("Oct  7 08:00:00 proxy syslogd[1]: restart", now, 1791352800, "a day of one digit after a space, in summer time");
+        bsdIs("<13>Oct 27 12:23:45 proxy x: y", now, 1793100225, "after a priority");
+        bsdIs("Dec 31 23:59:00 proxy x: y", 1798758600, 1798757940, "December read in January: the year before");
+        bsdIs("Oct 28 12:30:00 proxy x: y", now, now, "a day ahead is still this year, and after now: now");
+        bsdIs("Oct 28 12:30:01 proxy x: y", now, 1761651001, "a second more than a day ahead: the year before");
+        bsdIs("Oct 25 02:30:00 proxy x: y", now, 1792888200, "the hour the clocks are put back: the earlier");
+        bsdIs("Mar 29 02:30:00 proxy x: y", now, 1774744200, "the hour they skip: read with the offset after the change");
+        bsdIs("Oct 27 25:00:00 proxy x: y", now, now, "hour 25: now");
+        bsdIs("Feb 29 12:00:00 proxy x: y", now, now, "a leap day in a year without one: now");
+        bsdIs("Okt 27 12:00:00 proxy x: y", now, now, "no month of English: now");
+        bsdIs("Oct x7 12:00:00 proxy x: y", now, now, "a letter in the day: now");
+        bsdIs("Oct 27 12:00:00x proxy x: y", now, now, "no space after the time: now");
+        bsdIs("Oct 27 12:23", now, now, "cut short: now");
+        bsdIs("2026-10-16T13:55:41Z h p: x", now, 1792158941, "RFC 3339 is read as before");
+        return nil;
+    end;
+
+    function testBsdLevel(): Unit is
+        levelIs("Oct 27 12:00:00 proxy failed-daemon[1]: started", "info", "failed in the name of a program of the BSD form");
+        levelIs("Oct 27 12:00:00 error-host prog: all fine", "info", "error in the name of the host");
+        levelIs("Oct  7 08:00:00 proxy sshd[1]: error: connection failed", "error", "the words of its message");
+        levelIs("Oct 15 18:20:01 server systemd[1]: Finished audit-alert.service - APP ALERT FAILED", "info", "a job of systemd in the BSD form");
+        levelIs("Oct 15 18:20:01 server", "info", "no program: the words of the line");
+        levelIs("Oct 15 18:20:01 failed", "error", "no host: the words of the line");
+        levelIs("Okt 27 12:00:00 error-host prog: all fine", "error", "no month of English: no BSD form, the words of the whole line");
+        levelIs("Oct x7 12:00:00 error-host prog: all fine", "error", "a letter before the day: no BSD form, the words of the whole line");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,632 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Both forms are read by their shape at fixed places, so a line costs a few
+-- comparisons; the calendar is Standard.Calendar's.
+import Standard.Text (
+    substring
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    Stamp,
+    Zone,
+    Exactly,
+    Twice,
+    Skipped,
+    NotACivil,
+    instantOf,
+    localAt,
+    resolveLocal,
+    parseRfc3339
+);
+import Roxie.Level (
+    guessLevel
+);
+
+module body Roxie.Line is
+    -- The date of Hiawatha, "Fri 16 Oct 2026 12:29:45 +0200", and the bar
+    -- after it: ? any byte, 9 a digit.
+    constant hiawatha_date: Span[Nat8, Static] := "??? 99 ??? 9999 99:99:99 ?9999|";
+    constant months: Span[Nat8, Static] := "JanFebMarAprMayJunJulAugSepOctNovDec";
+    -- The longest address before the first bar: IPv6 in full, 45 bytes.
+    constant address_most: Index := 45;
+    -- The longest RFC 3339 time: 19 bytes, 10 of fraction, 6 of offset.
+    constant rfc_most: Index := 35;
+    -- The time of the BSD form, "Oct 27 12:23:45 ", the day with a space
+    -- before one digit, and its length.
+    constant bsd_shape: Span[Nat8, Static] := "??? ?9 99:99:99 ";
+    constant bsd_length: Index := 16;
+    -- How far ahead of now the year of now may put a line of the BSD form
+    -- before it is read in the year before: a day.
+    constant bsd_ahead: Int64 := 86400;
+    -- The JSON key of slog's level and the opening quote of its value; no
+    -- 9 in it, so shapedAt compares every byte.
+    constant level_key: Span[Nat8, Static] := "\"level\":\"";
+    -- The key of logfmt's level, at the start of the line or after a space.
+    constant logfmt_key: Span[Nat8, Static] := "level=";
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    -- Whether text has, from at on, digits where pattern has 9, any byte
+    -- where it has ?, and the byte of pattern elsewhere.
+    generic [T: Region]
+    function shapedAt(text: Span[Nat8, T], at: Index, pattern: Span[Nat8, Static]): Bool is
+        if spanLength(text) < at then
+            return false;
+        end if;
+        if (spanLength(text) - at) < spanLength(pattern) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(pattern) do
+            if pattern[i] = '9' then
+                if not isDigit(text[at + i]) then
+                    return false;
+                end if;
+            else
+                if (pattern[i] /= '?') and (text[at + i] /= pattern[i]) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The number of count digits at at, which are digits.
+    generic [T: Region]
+    function digitsAt(text: Span[Nat8, T], at: Index, count: Index): Int64 is
+        var number: Int64 := 0;
+        var i: Index := 0;
+        while i < count do
+            case toInt64(text[at + i] - '0') of
+                when Some(value as digit: Int64) do
+                    number := (number * 10) + digit;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return number;
+    end;
+
+    -- 1 to 12 for the English name of a month in three letters at at, 0
+    -- for none.
+    generic [T: Region]
+    function monthAt(text: Span[Nat8, T], at: Index): Int64 is
+        let names: Span[Nat8, Static] := months;
+        var m: Index := 0;
+        while m < 12 do
+            if ((text[at] = names[m * 3]) and (text[at + 1] = names[(m * 3) + 1])) and (text[at + 2] = names[(m * 3) + 2]) then
+                case toInt64(m + 1) of
+                    when Some(value as number: Int64) do
+                        return number;
+                    when None do
+                        return 0;
+                end case;
+            end if;
+            m := m + 1;
+        end while;
+        return 0;
+    end;
+
+    -- A value from 0 to 9999 as Nat8 or Int32; 0 when it does not fit, which
+    -- makes no valid Civil of a month or a day, and is never asked of an
+    -- hour, a minute or a second, which have two digits.
+    function nat8Of(value: Int64): Nat8 is
+        case toNat8(value) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function int32Of(value: Int64): Int32 is
+        case toInt32(value) of
+            when Some(value as narrowed: Int32) do
+                return narrowed;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The place of the first bar within the first address_most + 1 bytes.
+    generic [T: Region]
+    function firstBar(text: Span[Nat8, T]): Option[Index] is
+        var i: Index := 0;
+        while (i < spanLength(text)) and (i <= address_most) do
+            if text[i] = '|' then
+                return Some(value => i);
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    -- Where the date of Hiawatha begins, when the line has one after its
+    -- first bar.
+    generic [T: Region]
+    function hiawathaDateAt(text: Span[Nat8, T]): Option[Index] is
+        case firstBar(text) of
+            when Some(value as bar: Index) do
+                let d: Index := bar + 1;
+                if not shapedAt(text, d, hiawatha_date) then
+                    return None();
+                end if;
+                if (text[d + 25] /= '+') and (text[d + 25] /= '-') then
+                    return None();
+                end if;
+                return Some(value => d);
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [T: Region]
+    function hiawathaTime(text: Span[Nat8, T]): Option[Int64] is
+        case hiawathaDateAt(text) of
+            when Some(value as d: Index) do
+                let month: Int64 := monthAt(text, d + 7);
+                if month = 0 then
+                    return None();
+                end if;
+                var offset: Int64 := (digitsAt(text, d + 26, 2) * 3600) + (digitsAt(text, d + 28, 2) * 60);
+                if text[d + 25] = '-' then
+                    offset := 0 - offset;
+                end if;
+                let civil: Civil := Civil(
+                    year => int32Of(digitsAt(text, d + 11, 4)),
+                    month => nat8Of(month),
+                    day => nat8Of(digitsAt(text, d + 4, 2)),
+                    hour => nat8Of(digitsAt(text, d + 16, 2)),
+                    minute => nat8Of(digitsAt(text, d + 19, 2)),
+                    second => nat8Of(digitsAt(text, d + 22, 2)),
+                    nanos => 0
+                );
+                case instantOf(civil, int32Of(offset)) of
+                    when Some(value as instant: Instant) do
+                        return Some(value => instant.seconds);
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- RFC 3339 up to the first space, within rfc_most bytes.
+    generic [T: Region]
+    function syslogTime(text: Span[Nat8, T]): Option[Int64] is
+        var i: Index := 0;
+        while (i < spanLength(text)) and (i <= rfc_most) do
+            if text[i] = ' ' then
+                case parseRfc3339(substring(text, 0, i)) of
+                    when Some(value as stamp: Stamp) do
+                        return Some(value => stamp.instant.seconds);
+                    when None do
+                        return None();
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    -- Where the line goes on after a priority "<PRI>" at its start (RFC 5424,
+    -- RFC 3164) of up to three digits and at most 191, and after the
+    -- version "1 " of RFC 5424; None for a line without one.
+    generic [T: Region]
+    function priEnd(text: Span[Nat8, T]): Option[Index] is
+        let size: Index := spanLength(text);
+        if (size < 3) or (text[0] /= '<') then
+            return None();
+        end if;
+        var i: Index := 1;
+        while ((i < size) and (i < 4)) and isDigit(text[i]) do
+            i := i + 1;
+        end while;
+        if ((i = 1) or (i >= size)) or (text[i] /= '>') then
+            return None();
+        end if;
+        if digitsAt(text, 1, i - 1) > (191 : Int64) then
+            return None();
+        end if;
+        if shapedAt(text, i + 1, "1 ") then
+            return Some(value => i + 3);
+        end if;
+        return Some(value => i + 1);
+    end;
+
+    -- The level of the severity of a priority at the start of the line:
+    -- 0 to 3 error, 4 warn, 5 and 6 info, 7 debug.
+    generic [T: Region]
+    function priLevel(text: Span[Nat8, T]): Option[Span[Nat8, Static]] is
+        case priEnd(text) of
+            when Some(value as after: Index) do
+                var close: Index := 2;
+                while text[close] /= '>' do
+                    close := close + 1;
+                end while;
+                let priority: Int64 := digitsAt(text, 1, close - 1);
+                let severity: Int64 := priority - ((priority / (8 : Int64)) * (8 : Int64));
+                if severity <= (3 : Int64) then
+                    return Some(value => "error");
+                end if;
+                if severity = (4 : Int64) then
+                    return Some(value => "warn");
+                end if;
+                if severity = (7 : Int64) then
+                    return Some(value => "debug");
+                end if;
+                return Some(value => "info");
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [T: Region]
+    function parseLineTime(text: Span[Nat8, T]): Option[Int64] is
+        case priEnd(text) of
+            when Some(value as after: Index) do
+                return syslogTime(substring(text, after, spanLength(text)));
+            when None do
+                skip;
+        end case;
+        case syslogTime(text) of
+            when Some(value as seconds: Int64) do
+                return Some(value => seconds);
+            when None do
+                return hiawathaTime(text);
+        end case;
+    end;
+
+    -- Whether the line begins with the time of the BSD form: a month, a
+    -- day of one digit after a space or of two, the time of day, a space.
+    generic [T: Region]
+    function bsdShaped(text: Span[Nat8, T]): Bool is
+        if not shapedAt(text, 0, bsd_shape) then
+            return false;
+        end if;
+        if (text[4] /= ' ') and (not isDigit(text[4])) then
+            return false;
+        end if;
+        return monthAt(text, 0) > 0;
+    end;
+
+    -- The instant a clock in zone shows the BSD time of the line at, in
+    -- year.  The hour the clocks are put back comes twice: the earlier;
+    -- an hour they skip: before, read with the offset after the change.
+    generic [T: Region, Z: Region]
+    function bsdIn(text: Span[Nat8, T], zone: &[Zone, Z], year: Int32): Option[Int64] is
+        var day: Int64 := digitsAt(text, 5, 1);
+        if text[4] /= ' ' then
+            day := digitsAt(text, 4, 2);
+        end if;
+        let civil: Civil := Civil(
+            year => year,
+            month => nat8Of(monthAt(text, 0)),
+            day => nat8Of(day),
+            hour => nat8Of(digitsAt(text, 7, 2)),
+            minute => nat8Of(digitsAt(text, 10, 2)),
+            second => nat8Of(digitsAt(text, 13, 2)),
+            nanos => 0
+        );
+        case resolveLocal(zone, civil) of
+            when Exactly(instant as at: Instant) do
+                return Some(value => at.seconds);
+            when Twice(earlier as first: Instant, later as second: Instant) do
+                return Some(value => first.seconds);
+            when Skipped(before as first: Instant, after as second: Instant) do
+                return Some(value => first.seconds);
+            when NotACivil do
+                return None();
+        end case;
+    end;
+
+    -- The time of a line of the BSD form: in the year a clock in
+    -- zone shows at now, or the year before when that is more than
+    -- bsd_ahead after now (a line of December read in January).
+    generic [T: Region, Z: Region]
+    function bsdTime(text: Span[Nat8, T], zone: &[Zone, Z], now: Int64): Option[Int64] is
+        if not bsdShaped(text) then
+            return None();
+        end if;
+        case localAt(zone, Instant(seconds => now, nanos => 0)) of
+            when None do
+                return None();
+            when Some(value as today: Civil) do
+                case bsdIn(text, zone, today.year) of
+                    when Some(value as seconds: Int64) do
+                        if (seconds - bsd_ahead) <= now then
+                            return Some(value => seconds);
+                        end if;
+                        return bsdIn(text, zone, today.year - 1);
+                    when None do
+                        return None();
+                end case;
+        end case;
+    end;
+
+    -- What the line says: syslog or Hiawatha, else the BSD form, after a
+    -- priority as well.
+    generic [T: Region, Z: Region]
+    function timeOf(text: Span[Nat8, T], zone: &[Zone, Z], now: Int64): Option[Int64] is
+        case parseLineTime(text) of
+            when Some(value as seconds: Int64) do
+                return Some(value => seconds);
+            when None do
+                skip;
+        end case;
+        case priEnd(text) of
+            when Some(value as after: Index) do
+                return bsdTime(substring(text, after, spanLength(text)), zone, now);
+            when None do
+                return bsdTime(text, zone, now);
+        end case;
+    end;
+
+    generic [T: Region, Z: Region]
+    function lineTime(text: Span[Nat8, T], zone: &[Zone, Z], now: Int64): Int64 is
+        case timeOf(text, zone, now) of
+            when Some(value as seconds: Int64) do
+                if (seconds >= 0) and (seconds <= now) then
+                    return seconds;
+                end if;
+                return now;
+            when None do
+                return now;
+        end case;
+    end;
+
+    generic [T: Region]
+    function lineLevel(text: Span[Nat8, T]): Span[Nat8, Static] is
+        case priLevel(text) of
+            when Some(value as level: Span[Nat8, Static]) do
+                return level;
+            when None do
+                skip;
+        end case;
+        case hiawathaDateAt(text) of
+            when Some(value as d: Index) do
+                -- An access line: the status of three digits and a bar.
+                if shapedAt(text, d + 31, "999|") then
+                    if text[d + 31] >= '5' then
+                        return "error";
+                    end if;
+                    if text[d + 31] = '4' then
+                        return "warn";
+                    end if;
+                    return "info";
+                end if;
+                return levelOfWords(text);
+            when None do
+                if systemdJob(text) then
+                    return "info";
+                end if;
+                return levelOfWords(messageOf(text));
+        end case;
+    end;
+
+    generic [T: Region]
+    function isSyslog(text: Span[Nat8, T]): Bool is
+        case syslogTime(text) of
+            when Some(value as seconds: Int64) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether text holds word from at on.
+    generic [T: Region]
+    function literalAt(text: Span[Nat8, T], at: Index, word: Span[Nat8, Static]): Bool is
+        if (at > spanLength(text)) or ((spanLength(text) - at) < spanLength(word)) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if text[at + i] /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether a line of syslog tells that systemd changed a job:
+    -- "TIME HOST systemd[PID]: ", one of its verbs and a space.  systemd
+    -- writes these with the priority of info; what follows the verb is the
+    -- name and the description of a unit, whose words are no level
+    -- ("Finished audit-alert.service - APP ALERT").  "Failed to start"
+    -- and "Failed with result" are none of these verbs.
+    -- Where the program begins in a line of syslog, "TIME HOST PROGRAM",
+    -- the time of RFC 3339 or of the BSD form; None for a line
+    -- of another form or without a space after the host.
+    generic [T: Region]
+    function programAt(text: Span[Nat8, T]): Option[Index] is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        if bsdShaped(text) then
+            i := bsd_length;
+        else
+            if not isSyslog(text) then
+                return None();
+            end if;
+            while (i < size) and (text[i] /= ' ') do
+                i := i + 1;
+            end while;
+            i := i + 1;
+        end if;
+        while (i < size) and (text[i] /= ' ') do
+            i := i + 1;
+        end while;
+        if i >= size then
+            return None();
+        end if;
+        return Some(value => i + 1);
+    end;
+
+    generic [T: Region]
+    function systemdJob(text: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(text);
+        case programAt(text) of
+            when None do
+                return false;
+            when Some(value as program: Index) do
+                if not literalAt(text, program, "systemd[") then
+                    return false;
+                end if;
+                var i: Index := program;
+                while (i < size) and (text[i] /= ' ') do
+                    i := i + 1;
+                end while;
+                if text[i - 1] /= ':' then
+                    return false;
+                end if;
+                let verb: Index := i + 1;
+                if (literalAt(text, verb, "Starting ") or literalAt(text, verb, "Started ")) or (literalAt(text, verb, "Stopping ") or literalAt(text, verb, "Stopped ")) then
+                    return true;
+                end if;
+                return (literalAt(text, verb, "Finished ") or literalAt(text, verb, "Reloading ")) or literalAt(text, verb, "Reloaded ");
+        end case;
+    end;
+
+    -- The message of a line of syslog, after "TIME HOST PROGRAM[PID]: ", so
+    -- that the name of a program (audit-alert) or of a host is no word of
+    -- its level; after "TIME HOST " when the program ends
+    -- without a colon; the whole line for another form.
+    generic [T: Region]
+    function messageOf(text: Span[Nat8, T]): Span[Nat8, T] is
+        let size: Index := spanLength(text);
+        case programAt(text) of
+            when None do
+                return substring(text, 0, size);
+            when Some(value as program: Index) do
+                var i: Index := program;
+                while (i < size) and (text[i] /= ' ') do
+                    i := i + 1;
+                end while;
+                if (i > program) and (text[i - 1] = ':') then
+                    return substring(text, i, size);
+                end if;
+                return substring(text, program, size);
+        end case;
+    end;
+
+    -- The level a field of the line names (slog's JSON "level":"…" and
+    -- logfmt's level=…), else the words of the line
+    --.
+    generic [T: Region]
+    function levelOfWords(text: Span[Nat8, T]): Span[Nat8, Static] is
+        case keyLevel(text) of
+            when Some(value as level: Span[Nat8, Static]) do
+                return level;
+            when None do
+                return guessLevel(text);
+        end case;
+    end;
+
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    -- Whether text from first to before stop is word, in any case.
+    generic [T: Region]
+    function wordAt(text: Span[Nat8, T], first: Index, stop: Index, word: Span[Nat8, Static]): Bool is
+        if (stop - first) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if lower(text[first + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- debug, info or warn for the name of a level from first to before
+    -- stop, in any case, as slog, logrus and syslog name them; None for
+    -- another name.  notice and audit (Tweety's level of its audit records)
+    -- are info.  A name of error (error, err, fatal, crit, critical, alert,
+    -- emerg, panic) is left to the words, which read it as error.
+    generic [T: Region]
+    function nameLevel(text: Span[Nat8, T], first: Index, stop: Index): Option[Span[Nat8, Static]] is
+        if wordAt(text, first, stop, "debug") or wordAt(text, first, stop, "trace") then
+            return Some(value => "debug");
+        end if;
+        if (wordAt(text, first, stop, "info") or wordAt(text, first, stop, "notice")) or wordAt(text, first, stop, "audit") then
+            return Some(value => "info");
+        end if;
+        if wordAt(text, first, stop, "warn") or wordAt(text, first, stop, "warning") then
+            return Some(value => "warn");
+        end if;
+        return None();
+    end;
+
+    -- The level of the value from first: up to its closing quote when
+    -- quoted, else up to a space or the end; at most 16 bytes, more than
+    -- the longest name.
+    generic [T: Region]
+    function valueLevel(text: Span[Nat8, T], first: Index, quoted: Bool): Option[Span[Nat8, Static]] is
+        let size: Index := spanLength(text);
+        var stop: Index := first;
+        if quoted then
+            while (stop < size) and ((text[stop] /= '"') and ((stop - first) < 16)) do
+                stop := stop + 1;
+            end while;
+            if (stop >= size) or (text[stop] /= '"') then
+                return None();
+            end if;
+        else
+            while (stop < size) and ((text[stop] /= ' ') and ((stop - first) < 16)) do
+                stop := stop + 1;
+            end while;
+        end if;
+        return nameLevel(text, first, stop);
+    end;
+
+    -- Whether a key may begin at at: at the start or after a space.
+    generic [T: Region]
+    function keyStart(text: Span[Nat8, T], at: Index): Bool is
+        if at = 0 then
+            return true;
+        end if;
+        return text[at - 1] = ' ';
+    end;
+
+    -- The level of the first "level":"…" or level=… of text; None for none,
+    -- or for a first one that names no level.
+    generic [T: Region]
+    function keyLevel(text: Span[Nat8, T]): Option[Span[Nat8, Static]] is
+        let json: Span[Nat8, Static] := level_key;
+        let logfmt: Span[Nat8, Static] := logfmt_key;
+        let size: Index := spanLength(text);
+        var at: Index := 0;
+        while at < size do
+            if shapedAt(text, at, json) then
+                return valueLevel(text, at + spanLength(json), true);
+            end if;
+            if keyStart(text, at) and shapedAt(text, at, logfmt) then
+                let first: Index := at + spanLength(logfmt);
+                if (first < size) and (text[first] = '"') then
+                    return valueLevel(text, first + 1, true);
+                end if;
+                return valueLevel(text, first, false);
+            end if;
+            at := at + 1;
+        end while;
+        return None();
+    end;
+end module body.

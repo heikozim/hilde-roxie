@@ -1,0 +1,255 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Batches written and read back, and every way a batch is refused, with
+-- the number of the line where.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth
+);
+import Roxie.Wire (
+    WireProblem,
+    BatchTooLarge,
+    NoBatchHeader,
+    NoLines,
+    TooManyBatchLines,
+    NoLineEnd,
+    MissingField,
+    BadLineTime,
+    FutureTime,
+    BadLevel,
+    BadSource,
+    BadText,
+    WireError,
+    WireLine,
+    Batch,
+    mostBatchLines,
+    mostBatchBytes,
+    mostTextBytes,
+    mostSkew,
+    readBatch,
+    destroyBatch,
+    batchHeader,
+    writeLine,
+    lineSize,
+    problemName
+);
+
+module body Roxie.Wire.Test is
+    constant now: Int64 := 1792022400;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [B: Region]
+    function refused(data: Span[Nat8, B], line: Index, problem: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case readBatch(data, now) of
+            when Left(left as error: WireError) do
+                let fit: Bool := (error.line = line) and equal(problemName(error.problem), problem);
+                if not fit then
+                    printLn(problemName(error.problem));
+                end if;
+                assertTrue(fit, message);
+            when Right(right as batch: Batch) do
+                destroyBatch(batch);
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testRules(): Unit is
+        assertTrue(mostBatchLines() = 1000, "1000 lines");
+        assertTrue(mostBatchBytes() = 1048576, "1 MiB");
+        assertTrue(mostTextBytes() = 16384, "16 KiB a text");
+        assertTrue(mostSkew() = 300, "300 seconds");
+        assertTrue(lineSize(5, 10, 20) = 51, "16 and the fields");
+        assertTrue(lineSize(5, 10, 100000) = 16415, "the text cut");
+        let header: String := batchHeader(42);
+        assertTrue(equal(asSpan(&header), "roxie 1 42\n"), "a header");
+        destroyString(header);
+        return nil;
+    end;
+
+    function testRoundTrip(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "roxie 1 7\n");
+        assertTrue(writeLine(&!out, now, "error", "/var/log/syslog", "mariadb: table full"), "a line");
+        var odd: StringBuilder := makeStringBuilder();
+        writeString(&!odd, "a\ttab\rand");
+        writeByte(&!odd, 0);
+        let odd_text: String := finalize(odd);
+        assertTrue(writeLine(&!out, 0, "info", "/a b.log", asSpan(&odd_text)), "control bytes");
+        destroyString(odd_text);
+        assertFalse(writeLine(&!out, 0 - 1, "info", "/a", "x"), "a time below 0");
+        assertFalse(writeLine(&!out, 1000000000000, "info", "/a", "x"), "a time of 13 digits");
+        assertFalse(writeLine(&!out, 0, "Info", "/a", "x"), "no level");
+        assertFalse(writeLine(&!out, 0, "info", "a\tb", "x"), "a tab in the source");
+        assertTrue(writeLine(&!out, 5, "debug", "/a", ""), "an empty text");
+        let data: String := finalize(out);
+        case readBatch(asSpan(&data), now) of
+            when Right(right as batch: Batch) do
+                let { number as n: Int64, lines as lines: Buffer[WireLine] } := batch;
+                assertTrue(n = 7, "the number of the batch");
+                assertTrue(length(&lines) = 3, "three lines, the refused ones not written");
+                let first: WireLine := nth(&lines, 0);
+                assertTrue(first.at = now, "the time");
+                assertTrue(equal(substring(asSpan(&data), first.levelStart, first.levelStop), "error"), "the level");
+                assertTrue(equal(substring(asSpan(&data), first.sourceStart, first.sourceStop), "/var/log/syslog"), "the source");
+                assertTrue(equal(substring(asSpan(&data), first.textStart, first.textStop), "mariadb: table full"), "the text");
+                let second: WireLine := nth(&lines, 1);
+                assertTrue(equal(substring(asSpan(&data), second.textStart, second.textStop), "a\ttab and "), "a tab kept, other control bytes as spaces");
+                let third: WireLine := nth(&lines, 2);
+                assertTrue(third.textStart = third.textStop, "the empty text");
+                destroyBatch(Batch(number => n, lines => lines));
+            when Left(left as error: WireError) do
+                printLn(problemName(error.problem));
+                assertTrue(false, "the batch read back");
+        end case;
+        destroyString(data);
+        return nil;
+    end;
+
+    -- A header and count copies of line.
+    function many(line: Span[Nat8, Static], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "roxie 1 1\n");
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, line);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function testLimits(): Unit is
+        let full: String := many("1\tinfo\t/a\tx\n", 1000);
+        case readBatch(asSpan(&full), now) of
+            when Right(right as batch: Batch) do
+                destroyBatch(batch);
+                assertTrue(true, "1000 lines");
+            when Left(left as error: WireError) do
+                assertTrue(false, "1000 lines");
+        end case;
+        destroyString(full);
+        let over: String := many("1\tinfo\t/a\tx\n", 1001);
+        refused(asSpan(&over), 1001, "TooManyBatchLines", "1001 lines");
+        destroyString(over);
+        var long: StringBuilder := makeStringBuilder();
+        writeString(&!long, "roxie 1 1\n1\tinfo\t/a\t");
+        var i: Index := 0;
+        while i < 16385 do
+            writeByte(&!long, 'x');
+            i := i + 1;
+        end while;
+        writeByte(&!long, 10);
+        let long_text: String := finalize(long);
+        refused(asSpan(&long_text), 1, "BadText", "a text of 16385 bytes");
+        destroyString(long_text);
+        var cut: StringBuilder := makeStringBuilder();
+        writeString(&!cut, "roxie 1 1\n");
+        var big: StringBuilder := makeStringBuilder();
+        i := (0 : Index);
+        while i < 20000 do
+            writeByte(&!big, 'y');
+            i := i + 1;
+        end while;
+        let big_text: String := finalize(big);
+        assertTrue(writeLine(&!cut, 1, "info", "/a", asSpan(&big_text)), "a long text written");
+        destroyString(big_text);
+        let cut_body: String := finalize(cut);
+        assertTrue(spanLength(asSpan(&cut_body)) = 16405, "cut to 16384 bytes: 10 + 10 + 16384 + 1");
+        case readBatch(asSpan(&cut_body), now) of
+            when Right(right as batch: Batch) do
+                destroyBatch(batch);
+                assertTrue(true, "a cut text is read");
+            when Left(left as error: WireError) do
+                assertTrue(false, "a cut text is read");
+        end case;
+        destroyString(cut_body);
+        let huge: String := many("1\tinfo\t/a\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", 8000);
+        refused(asSpan(&huge), 0, "BatchTooLarge", "more than 1 MiB");
+        destroyString(huge);
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        refused("", 0, "NoBatchHeader", "empty");
+        refused("roxie 1 1", 0, "NoBatchHeader", "a header without a line end");
+        refused("roxie 2 1\n1\tinfo\t/a\tx\n", 0, "NoBatchHeader", "another version");
+        refused("roxie 1 0\n1\tinfo\t/a\tx\n", 0, "NoBatchHeader", "batch 0");
+        refused("roxie 1 \n1\tinfo\t/a\tx\n", 0, "NoBatchHeader", "no number");
+        refused("roxie 1 1x\n1\tinfo\t/a\tx\n", 0, "NoBatchHeader", "a number that is none");
+        refused("roxie 1 1234567890123456789\n1\tinfo\t/a\tx\n", 0, "NoBatchHeader", "19 digits");
+        refused("roxie 1 1\n", 1, "NoLines", "no line");
+        refused("roxie 1 1\n1\tinfo\t/a\tx", 1, "NoLineEnd", "the last line without its end");
+        refused("roxie 1 1\n1\tinfo\t/a\tx\n2\tinfo\t/a\n", 2, "MissingField", "three fields");
+        refused("roxie 1 1\n1\tinfo\n", 1, "MissingField", "two fields");
+        refused("roxie 1 1\n\tinfo\t/a\tx\n", 1, "BadLineTime", "no time");
+        refused("roxie 1 1\n-1\tinfo\t/a\tx\n", 1, "BadLineTime", "a time below 0");
+        refused("roxie 1 1\n1000000000000\tinfo\t/a\tx\n", 1, "BadLineTime", "13 digits");
+        refused("roxie 1 1\n1792022701\tinfo\t/a\tx\n", 1, "FutureTime", "301 seconds ahead");
+        refused("roxie 1 1\n1\tERROR\t/a\tx\n", 1, "BadLevel", "a level in capitals");
+        refused("roxie 1 1\n1\t\t/a\tx\n", 1, "BadLevel", "no level");
+        refused("roxie 1 1\n1\tinfo\t\tx\n", 1, "BadSource", "no source");
+        refused("roxie 1 1\n1\tinfo\t/a\tx\ry\n", 1, "BadText", "a carriage return");
+        var escape: StringBuilder := makeStringBuilder();
+        writeString(&!escape, "roxie 1 1\n1\tinfo\t/a\tx");
+        writeByte(&!escape, 27);
+        writeString(&!escape, "[31m\n");
+        let escaped: String := finalize(escape);
+        refused(asSpan(&escaped), 1, "BadText", "a terminal escape");
+        destroyString(escaped);
+        case readBatch("roxie 1 1\n1792022700\tinfo\t/a\tx\n", now) of
+            when Right(right as batch: Batch) do
+                destroyBatch(batch);
+                assertTrue(true, "300 seconds ahead");
+            when Left(left as error: WireError) do
+                assertTrue(false, "300 seconds ahead");
+        end case;
+        case readBatch("roxie 1 9\n1\tinfo\t/a\thost=evil\tx\n", now) of
+            when Right(right as batch: Batch) do
+                let { number as n: Int64, lines as lines: Buffer[WireLine] } := batch;
+                let only: WireLine := nth(&lines, 0);
+                assertTrue((only.textStop - only.textStart) = 11, "a fourth tab is text, no field");
+                destroyBatch(Batch(number => n, lines => lines));
+            when Left(left as error: WireError) do
+                assertTrue(false, "a fourth tab is text, no field");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,22 @@
+# ROXIE -- FastCGI backend and toolkit.
+# Target: /etc/hiawatha/urltoolkit/roxie on server, loaded by
+# "Include urltoolkit" in hiawatha.conf.
+
+FastCGIserver {
+    FastCGIid = ROXIE
+    # roxie serve /run/roxie/roxie.sock (roxie.service); the socket is
+    # roxie:www-data 660 (roxie.tmpfiles). AppArmor names the path too
+    # (/etc/apparmor.d/usr.sbin.hiawatha).
+    ConnectTo = /run/roxie/roxie.sock
+    SessionTimeout = 10
+}
+
+# The stylesheet and the icons are files of the WebsiteRoot
+# /var/www/roxie, served by Hiawatha as Wolly serves its static files (Wolly
+#): exactly these names, nothing else of the directory. Every other
+# path goes to ROXIE, which answers 404 for what it does not know.
+UrlToolkit {
+    ToolkitID = roxie
+    Match ^/(style\.css|favicon\.ico|apple-touch-icon\.png|icons/roxie-(round-)?[0-9]+\.png)$ Return
+    Match .* UseFastCGI ROXIE
+}

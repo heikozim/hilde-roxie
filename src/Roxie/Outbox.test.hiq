@@ -1,0 +1,452 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Log files under /tmp with a random name each run: their lines collected
+-- into the outbox, read back as batches the collector takes, taken and set
+-- aside, and cut into batches by lines and by bytes.
+import Standard.Calendar (
+    Zone,
+    utcZone,
+    destroyZone
+);
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    contains
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    FileDescriptor,
+    createNewFile,
+    openAppend,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Standard.Buffer (
+    Buffer,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    start,
+    advance,
+    columnInt64,
+    finish,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Roxie.Wire (
+    WireError,
+    WireLine,
+    Batch,
+    readBatch,
+    destroyBatch,
+    mostBatchBytes
+);
+import Roxie.Outbox (
+    CollectFailure,
+    NotASource,
+    NotReadable,
+    CollectStorage,
+    Pending,
+    prepareOutbox,
+    startNumbersAt,
+    collectFile,
+    nextBatch,
+    destroyPending,
+    batchTaken,
+    setAside,
+    waiting
+);
+
+module body Roxie.Outbox.Test is
+    constant now: Int64 := 1792022400;
+
+    -- /tmp/roxie-outbox-<16 hex digits>-<suffix>
+    function tempPath(suffix: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/tmp/roxie-outbox-");
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                destroyString(raw);
+            when None do
+                abort("no random bytes");
+        end case;
+        writeString(&!out, "-");
+        writeString(&!out, suffix);
+        return finalize(out);
+    end;
+
+    generic [P: Region, T: Region]
+    function append(path: Span[Nat8, P], text: Span[Nat8, T]): Unit is
+        case openAppend(path, #o600) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                assertTrue(writeAll(&!file, text), "appended");
+                let closed: Bool := closeFile(file);
+            when None do
+                case createNewFile(path, #o600) of
+                    when Some(value as made: FileDescriptor) do
+                        var file: FileDescriptor := made;
+                        assertTrue(writeAll(&!file, text), "written");
+                        let closed: Bool := closeFile(file);
+                    when None do
+                        assertTrue(false, "the file made");
+                end case;
+        end case;
+        return nil;
+    end;
+
+    function nameOf(failure: CollectFailure): Span[Nat8, Static] is
+        case failure of
+            when NotASource do
+                return "NotASource";
+            when NotReadable do
+                return "NotReadable";
+            when CollectStorage do
+                return "CollectStorage";
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function collected(db: &![Database[Writing], R], path: Span[Nat8, P], lines: Int64, message: Span[Nat8, Static]): Unit is
+        let zone: Zone := utcZone();
+        case collectFile(&~db, path, &zone, now) of
+            when Right(right as count: Int64) do
+                assertTrue(count = lines, message);
+            when Left(left as failure: CollectFailure) do
+                printLn(nameOf(failure));
+                assertTrue(false, message);
+        end case;
+        destroyZone(zone);
+        return nil;
+    end;
+
+    generic [R: Region, P: Region]
+    function failed(db: &![Database[Writing], R], path: Span[Nat8, P], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let zone: Zone := utcZone();
+        case collectFile(&~db, path, &zone, now) of
+            when Right(right as count: Int64) do
+                assertTrue(false, message);
+            when Left(left as failure: CollectFailure) do
+                assertTrue(equal(nameOf(failure), wanted), message);
+        end case;
+        destroyZone(zone);
+        return nil;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function waits(db: &![Database[Writing], R], count: Int64, message: Span[Nat8, Static]): Unit is
+        case waiting(&~db) of
+            when Right(right as found: Int64) do
+                assertTrue(found = count, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- The lines of a batch the collector reads, or -1.
+    generic [D: Region]
+    function linesRead(data: Span[Nat8, D]): Int64 is
+        case readBatch(data, now) of
+            when Right(right as batch: Batch) do
+                let { number as n: Int64, lines as lines: Buffer[WireLine] } := batch;
+                let count: Index := length(&lines);
+                destroyBatch(Batch(number => n, lines => lines));
+                case toInt64(count) of
+                    when Some(value as wide: Int64) do
+                        return wide;
+                    when None do
+                        return 0 - 1;
+                end case;
+            when Left(left as error: WireError) do
+                return 0 - 1;
+        end case;
+    end;
+
+    -- The oldest batch: its number when it is number, holds part and is read
+    -- with lines lines; -1 when not.
+    generic [R: Region]
+    function oldestIs(db: &![Database[Writing], R], number: Int64, part: Span[Nat8, Static], lines: Int64,
+                      message: Span[Nat8, Static]): Unit is
+        case nextBatch(&~db) of
+            when Right(right as found: Option[Pending]) do
+                case found of
+                    when Some(value as pending: Pending) do
+                        let { number as n: Int64, data as d: String } := pending;
+                        let fit: Bool := ((n = number) and contains(asSpan(&d), part)) and (linesRead(asSpan(&d)) = lines);
+                        if not fit then
+                            printLn(asSpan(&d));
+                        end if;
+                        assertTrue(fit, message);
+                        destroyString(d);
+                    when None do
+                        assertTrue(false, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- The batches set aside as number 2 with the answer line 1: BadLevel and
+    -- the line they hold.
+    generic [R: Region]
+    function refusedKept(db: &![Database[Writing], R]): Int64 is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM roxie_refused WHERE number = 2 AND answer = 'line 1: BadLevel' AND lines LIKE '%now whole%'", noValues());
+        var count: Int64 := 0 - 1;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return 0 - 1;
+            when None do
+                return count;
+        end case;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareOutbox(&~db), "the tables");
+        assertTrue(prepareOutbox(&~db), "the tables again");
+        let path: String := tempPath("app.log");
+        append(asSpan(&path), "Oct 15 18:20:01 server systemd[1]: Started.\nmysqld: Table is marked as crashed and failed\r\nhalf a line");
+        collected(&~db, asSpan(&path), 2, "two whole lines, the half one waits");
+        waits(&~db, 1, "one batch");
+        oldestIs(&~db, 1, "roxie 1 1\n1792022400\tinfo\t", 2, "the first batch, read by the collector");
+        oldestIs(&~db, 1, "\terror\t", 2, "the line that failed is error");
+        oldestIs(&~db, 1, "crashed and failed\n", 2, "the carriage return dropped");
+        collected(&~db, asSpan(&path), 0, "nothing new");
+        waits(&~db, 1, "still one batch");
+        append(asSpan(&path), " now whole\nwarning: disk\n");
+        collected(&~db, asSpan(&path), 2, "the half line and one more");
+        waits(&~db, 2, "two batches");
+        oldestIs(&~db, 1, "systemd", 2, "the oldest first");
+        case batchTaken(&~db, 1) of
+            when Right(right as was: Bool) do
+                assertTrue(was, "batch 1 taken");
+            when Left(left as error: DbError) do
+                assertTrue(false, "batch 1 taken");
+        end case;
+        oldestIs(&~db, 2, "half a line now whole", 2, "then the second");
+        case setAside(&~db, 2, "line 1: BadLevel") of
+            when Right(right as was: Bool) do
+                assertTrue(was, "batch 2 set aside");
+            when Left(left as error: DbError) do
+                assertTrue(false, "batch 2 set aside");
+        end case;
+        waits(&~db, 0, "nothing waits");
+        assertTrue(refusedKept(&~db) = 1, "the batch kept aside with its answer");
+        case nextBatch(&~db) of
+            when Right(right as found: Option[Pending]) do
+                case found of
+                    when Some(value as pending: Pending) do
+                        destroyPending(pending);
+                        assertTrue(false, "an empty outbox");
+                    when None do
+                        assertTrue(true, "an empty outbox");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "an empty outbox");
+        end case;
+        case batchTaken(&~db, 2) of
+            when Right(right as was: Bool) do
+                assertFalse(was, "a batch set aside is not taken again");
+            when Left(left as error: DbError) do
+                assertTrue(false, "a batch set aside is not taken again");
+        end case;
+        append(asSpan(&path), "third\n");
+        collected(&~db, asSpan(&path), 1, "after a batch set aside");
+        oldestIs(&~db, 3, "roxie 1 3\n", 1, "the numbers go on");
+        let gone: String := tempPath("gone.log");
+        failed(&~db, asSpan(&gone), "NotReadable", "a file that is not there");
+        failed(&~db, "/tmp/a\nb", "NotASource", "a path with a line end");
+        failed(&~db, "", "NotASource", "no path");
+        waits(&~db, 1, "nothing put in by a failure");
+        destroyString(gone);
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    -- count lines of width bytes each.
+    function lineBlock(count: Index, width: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            var k: Index := 0;
+            while k < width do
+                writeByte(&!out, 'x');
+                k := k + 1;
+            end while;
+            writeByte(&!out, 10);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Takes every batch, each read whole by the collector; the lines of all.
+    generic [R: Region]
+    function drain(db: &![Database[Writing], R], most: Int64): Int64 is
+        var total: Int64 := 0;
+        var going: Bool := true;
+        var rounds: Int64 := 0;
+        while going and (rounds < most) do
+            case nextBatch(&~db) of
+                when Right(right as found: Option[Pending]) do
+                    case found of
+                        when Some(value as pending: Pending) do
+                            let { number as n: Int64, data as d: String } := pending;
+                            assertTrue(spanLength(asSpan(&d)) <= mostBatchBytes(), "a batch within 1 MiB");
+                            let read: Int64 := linesRead(asSpan(&d));
+                            assertTrue(read > 0, "a batch the collector reads");
+                            total := total + read;
+                            destroyString(d);
+                            case batchTaken(&~db, n) of
+                                when Right(right as was: Bool) do
+                                    skip;
+                                when Left(left as error: DbError) do
+                                    going := false;
+                            end case;
+                        when None do
+                            going := false;
+                    end case;
+                when Left(left as error: DbError) do
+                    going := false;
+            end case;
+            rounds := rounds + 1;
+        end while;
+        return total;
+    end;
+
+    generic [R: Region]
+    function exerciseCuts(db: &![Database[Writing], R]): Unit is
+        assertTrue(prepareOutbox(&~db), "the tables");
+        let short: String := tempPath("short.log");
+        let many: String := lineBlock(2500, 20);
+        append(asSpan(&short), asSpan(&many));
+        destroyString(many);
+        collected(&~db, asSpan(&short), 2500, "2500 lines");
+        waits(&~db, 3, "1000, 1000 and 500 lines");
+        assertTrue(drain(&~db, 10) = 2500, "every line in a batch");
+        let wide: String := tempPath("wide.log");
+        -- 700 lines of 1501 bytes are more than the 1 MiB LogTail reads at
+        -- once: 698 lines (1047698 bytes) first, and more than 1 MiB as a
+        -- batch, so two batches; the last 2 lines in the next call.
+        let big: String := lineBlock(700, 1500);
+        append(asSpan(&wide), asSpan(&big));
+        destroyString(big);
+        collected(&~db, asSpan(&wide), 698, "698 lines of 1500 bytes in one call");
+        waits(&~db, 2, "cut by bytes into two batches");
+        collected(&~db, asSpan(&wide), 2, "the last two");
+        assertTrue(drain(&~db, 10) = 700, "every wide line in a batch");
+        let a: Bool := removeFileIfThere(asSpan(&short));
+        let b: Bool := removeFileIfThere(asSpan(&wide));
+        destroyString(short);
+        destroyString(wide);
+        return nil;
+    end;
+
+    function testOutbox(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- A new outbox numbers above the start it is given, once; one that
+    -- numbered a batch keeps its numbers.
+    function testStartNumbers(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                assertTrue(prepareOutbox(&!db), "the tables");
+                assertTrue(startNumbersAt(&!db, 5000), "a start for the numbers");
+                assertTrue(startNumbersAt(&!db, 9000), "a second start changes nothing");
+                let path: String := tempPath("start.log");
+                append(asSpan(&path), "first\n");
+                collected(&!db, asSpan(&path), 1, "a line");
+                oldestIs(&!db, 5001, "roxie 1 5001\n", 1, "the first batch above the start");
+                case batchTaken(&!db, 5001) of
+                    when Right(right as was: Bool) do
+                        assertTrue(was, "batch 5001 taken");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "batch 5001 taken");
+                end case;
+                assertTrue(startNumbersAt(&!db, 9000), "a start once a batch was numbered");
+                append(asSpan(&path), "second\n");
+                collected(&!db, asSpan(&path), 1, "another line");
+                oldestIs(&!db, 5002, "roxie 1 5002\n", 1, "the numbers go on from there");
+                let removed: Bool := removeFileIfThere(asSpan(&path));
+                destroyString(path);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testCuts(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseCuts(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

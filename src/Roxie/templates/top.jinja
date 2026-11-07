@@ -1,0 +1,22 @@
+{#
+Part of ROXIE, a log collector on Wolly.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The head of the dashboard, the search and the help: the search field, the
+link to the page of help and the form to log out.  A GET form, so a
+search is a link that can be kept.
+-#}
+<nav class="roxie-top">
+<form class="roxie-search" method="get" action="/search" role="search">
+<label for="q">Query</label>
+<input id="q" name="q" type="search" value="{{ query }}" size="60" placeholder="host:server and level:error and time:last 24h and &#34;mariadb&#34;">
+<button>Search</button>
+<a class="roxie-help-link" href="/help">Help</a>
+</form>
+<form class="roxie-logout" method="post" action="/logout">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button>Log out</button>
+</form>
+</nav>

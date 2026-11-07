@@ -1,0 +1,106 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The sign-in through RAMBO: the settings of the client from the
+text of rambo.conf and the secret, and the accounts of RAMBO the operator
+allowed, each bound to one user of the pages.
+
+rambo.conf has one setting a line, the name, a space and the value; a line
+that begins with # is a comment:
+
+    issuer https://auth.example.org
+    client roxie
+    redirect https://roxie.example.org/oauth/callback
+    ca /etc/ssl/certs/ca-certificates.crt
+
+An account of RAMBO is its sub, opaque and stable; the pair (issuer, sub)
+names it, and the issuer is the one of rambo.conf.  A sub nobody bound
+opens no session.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Wolly.Rambo (
+    RamboConfig
+);
+
+module Roxie.Sign is
+    """
+    The longest sub that is bound: 255 bytes.
+    """
+    function subMost(): Index
+        ensures result = 255;
+
+    """
+    Whether sub may be bound: 1 to subMost bytes of printable ASCII, no
+    space.  The walk over the bytes costs more than O(1); the promise is
+    only on the length.
+    """
+    generic [S: Region]
+    function isSub(sub: Span[Nat8, S]): Bool
+        ensures (not result) or ((spanLength(sub) >= 1) and (spanLength(sub) <= subMost()));
+
+    """
+    The settings of text, the content of rambo.conf, with the client secret
+    secret (the content of rambo-secret, its line end taken off): None when
+    a setting is missing, named twice or unknown, or Wolly.Rambo refuses
+    them.
+
+    No contract: an Option read from text.
+    """
+    generic [T: Region, S: Region]
+    function readSignConfig(text: Span[Nat8, T], secret: Span[Nat8, S]): Option[RamboConfig];
+
+    """
+    The redirect URI of text, for the address to come back to after the
+    logout of RAMBO: its scheme and host followed by /signed-out.  None
+    when text has no redirect.
+
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function signedOutUri(text: Span[Nat8, T]): Option[String];
+
+    """
+    Makes the table of the bound accounts when it is not there.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareSign(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Binds sub to the user name, in place of a binding sub had: Right false,
+    and nothing bound, when sub is no sub or name no user name of
+    Wolly.Auth.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, S: Region, N: Region]
+    function bindSub(db: &![Database[Writing], R], sub: Span[Nat8, S], name: Span[Nat8, N]): Either[DbError, Bool];
+
+    """
+    The user name sub is bound to, or None.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, S: Region]
+    function userOfSub(db: &![Database[Writing], R], sub: Span[Nat8, S]): Either[DbError, Option[String]];
+
+    """
+    Takes every binding to name out; Right how many.
+
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function unbindUser(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Nat64];
+end module.

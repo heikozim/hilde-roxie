@@ -1,0 +1,30 @@
+# The mutations of Roxie.Ingest, sourced by scripts/in-gate.sh.
+mutations+=(
+	"Ingest.hiq|s/        if not validHostname(host) then/        if false then/|a token owner that is no host"
+	"Ingest.hiq|s/                if number < position.number then/                if false then/|an older batch kept"
+	"Ingest.hiq|s/                    first := position.kept;/                    first := (0 : Int64);/|a batch cut short kept again from its start"
+	"Ingest.hiq|s/                if first >= total then/                if first > total then/|a batch kept whole is not repeated"
+	"Ingest.hiq|s/withText(noValues(), host), number), wide(i + 1)))/withText(noValues(), host), number), wide(i)))/|the position a line behind"
+	"Ingest.hiq|s/        if spanLength(level) \/= 5 then/        if true then/|no error counted"
+	"Ingest.hiq|s/                count(\&~db, \"roxie.refused\", now, 1);/                skip;/|a refused batch not counted"
+	"Ingest.hiq|s/        if not post then/        if false then/|any method"
+	"Ingest.hiq|s/^                                return unauthorized();/                                return ingestAnswer(NotAHost());/|an unknown token is forbidden, not unauthorized"
+	"Ingest.hiq|s/respond(plain(400), asSpan(\&text))/respond(plain(200), asSpan(\&text))/|a refused batch answered 200"
+	"Ingest.hiq|s/                    if taken = 0 then/                    if false then/|a prune that never sees its end"
+	"Ingest.hiq|s/constant pruneStepsMost: Int64 := 10000;/constant pruneStepsMost: Int64 := 10001;/|10001 steps a prune"
+	"Ingest.hiq|s/        case pruneMetrics(\&~db, before) of/        case pruneMetrics(\&~db, 0) of/|the samples not pruned"
+	"Ingest.hiq|s/                                if not sameName(asSpan(\&host), certified) then/                                if false then/|the token of one host with the certificate of another"
+	"Ingest.hiq|s/            var fieldStart: Bool := (i = 0);/            var fieldStart: Bool := true;/|CN inside the value of another field"
+	"Ingest.hiq|s/                if (subject\[i - 2\] = ',') and (subject\[i - 1\] = ' ') then/                if subject[i - 1] = ',' then/|a field after a comma without its space"
+	"Ingest.hiq|s/                if found then/                if false then/|CN twice, the last taken"
+	"Ingest.hiq|s/        if not validHostname(name) then/        if false then/|a CN that is no host name"
+	"Ingest.hiq|s/            if (name\[j\] >= 'A') and (name\[j\] <= 'Z') then/            if false then/|a CN in capitals"
+	"Ingest.hiq|s/                while (past < size) and (subject\[past\] \/= ',') do/                while past < size do/|the CN runs on into the next field"
+	#: relevel.
+	"Ingest.hiq|s/            if storedCode(columnText(\&cursor, 1)) \/= wanted then/            if false then/|relevel changes nothing"
+	"Ingest.hiq|s/            if storedCode(columnText(\&cursor, 1)) \/= wanted then/            if true then/|relevel counts every line as changed"
+	"Ingest.hiq|s/levelName(nth(codes, i))) of/\"error\") of/|every changed line made error"
+	#: relevel writes 10 lines a transaction.
+	"Ingest.hiq|s/            i := i + relevelWriteMost;/            i := i + relevelWriteMost + 1;/|a line between two transactions is left out"
+	"Ingest.hiq|s/((i - first) < relevelWriteMost)) do/((i - first) < 1)) do/|a transaction writes only its first line"
+)

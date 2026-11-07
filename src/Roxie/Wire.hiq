@@ -1,0 +1,335 @@
+--
+-- Part of ROXIE, a log collector on Wolly.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A batch is read in one pass over its bytes: the header, then each line
+-- by its line end and its three tabs.  A line is checked by lineAt, which
+-- holds nothing linear; the loop only collects.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    parseInt
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Wolly.LogStore (
+    isLevel,
+    isSource
+);
+import Wolly.Response (
+    decimalText
+);
+
+module body Roxie.Wire is
+    constant batch_lines_most: Index := 1000;
+    constant batch_bytes_most: Index := 1048576;
+    constant text_most: Index := 16384;
+    constant skew_most: Int64 := 300;
+    constant time_digits_most: Index := 12;
+    constant number_digits_most: Index := 18;
+    constant time_most: Int64 := 999999999999;
+    constant header_start: Span[Nat8, Static] := "roxie 1 ";
+
+    -- A line that was read and where the next one begins.
+    record Parsed: Free is
+        line: WireLine;
+        next: Index;
+    end;
+
+    function mostBatchLines(): Index is
+        return batch_lines_most;
+    end;
+
+    function mostBatchBytes(): Index is
+        return batch_bytes_most;
+    end;
+
+    function mostTextBytes(): Index is
+        return text_most;
+    end;
+
+    function mostSkew(): Int64 is
+        return skew_most;
+    end;
+
+    function problemName(problem: WireProblem): Span[Nat8, Static] is
+        case problem of
+            when BatchTooLarge do
+                return "BatchTooLarge";
+            when NoBatchHeader do
+                return "NoBatchHeader";
+            when NoLines do
+                return "NoLines";
+            when TooManyBatchLines do
+                return "TooManyBatchLines";
+            when NoLineEnd do
+                return "NoLineEnd";
+            when MissingField do
+                return "MissingField";
+            when BadLineTime do
+                return "BadLineTime";
+            when FutureTime do
+                return "FutureTime";
+            when BadLevel do
+                return "BadLevel";
+            when BadSource do
+                return "BadSource";
+            when BadText do
+                return "BadText";
+        end case;
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    -- The number of 1 to most digits, or None.
+    generic [V: Region]
+    function digitsValue(value: Span[Nat8, V], most: Index): Option[Int64] is
+        let size: Index := spanLength(value);
+        if (size = 0) or (size > most) then
+            return None();
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if not isDigit(value[i]) then
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        return parseInt(value);
+    end;
+
+    -- The first place of byte in body from first to before stop, or stop.
+    generic [B: Region]
+    function findByte(data: Span[Nat8, B], first: Index, stop: Index, byte: Nat8): Index is
+        var i: Index := first;
+        while i < stop do
+            if data[i] = byte then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return stop;
+    end;
+
+    -- Whether the text from first to before stop may be the text of a
+    -- line: at most text_most bytes, no control byte but the tab.
+    generic [B: Region]
+    function isText(data: Span[Nat8, B], first: Index, stop: Index): Bool is
+        if (stop - first) > text_most then
+            return false;
+        end if;
+        var i: Index := first;
+        while i < stop do
+            let byte: Nat8 := data[i];
+            let control: Bool := ((byte < 32) and (byte /= 9)) or (byte = 127);
+            if control then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function refusedLine(problem: WireProblem): Either[WireProblem, Parsed] is
+        return Left(left => problem);
+    end;
+
+    -- The line that begins at first.
+    generic [B: Region]
+    function lineAt(data: Span[Nat8, B], first: Index, now: Int64): Either[WireProblem, Parsed] is
+        let size: Index := spanLength(data);
+        let line_end: Index := findByte(data, first, size, 10);
+        if line_end = size then
+            return refusedLine(NoLineEnd());
+        end if;
+        let tab1: Index := findByte(data, first, line_end, 9);
+        if tab1 = line_end then
+            return refusedLine(MissingField());
+        end if;
+        let tab2: Index := findByte(data, tab1 + 1, line_end, 9);
+        if tab2 = line_end then
+            return refusedLine(MissingField());
+        end if;
+        let tab3: Index := findByte(data, tab2 + 1, line_end, 9);
+        if tab3 = line_end then
+            return refusedLine(MissingField());
+        end if;
+        var at: Int64 := 0;
+        case digitsValue(substring(data, first, tab1), time_digits_most) of
+            when Some(value as seconds: Int64) do
+                at := seconds;
+            when None do
+                return refusedLine(BadLineTime());
+        end case;
+        if (at - skew_most) > now then
+            return refusedLine(FutureTime());
+        end if;
+        if not isLevel(substring(data, tab1 + 1, tab2)) then
+            return refusedLine(BadLevel());
+        end if;
+        if not isSource(substring(data, tab2 + 1, tab3)) then
+            return refusedLine(BadSource());
+        end if;
+        if not isText(data, tab3 + 1, line_end) then
+            return refusedLine(BadText());
+        end if;
+        let line: WireLine := WireLine(at => at, levelStart => tab1 + 1, levelStop => tab2, sourceStart => tab2 + 1,
+                                       sourceStop => tab3, textStart => tab3 + 1, textStop => line_end);
+        return Right(right => Parsed(line => line, next => line_end + 1));
+    end;
+
+    function refusedBatch(line: Index, problem: WireProblem): Either[WireError, Batch] is
+        return Left(left => WireError(line => line, problem => problem));
+    end;
+
+    -- The number of the header, and where the first line begins; None for
+    -- a header that is none.
+    generic [B: Region]
+    function headerOf(data: Span[Nat8, B]): Option[Parsed] is
+        let size: Index := spanLength(data);
+        let line_end: Index := findByte(data, 0, size, 10);
+        let expected: Span[Nat8, Static] := header_start;
+        let lead: Index := spanLength(expected);
+        if (line_end = size) or (line_end <= lead) then
+            return None();
+        end if;
+        var i: Index := 0;
+        while i < lead do
+            if data[i] /= expected[i] then
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        case digitsValue(substring(data, lead, line_end), number_digits_most) of
+            when Some(value as number: Int64) do
+                if number < 1 then
+                    return None();
+                end if;
+                let nothing: WireLine := WireLine(at => number, levelStart => 0, levelStop => 0, sourceStart => 0,
+                                                  sourceStop => 0, textStart => 0, textStop => 0);
+                return Some(value => Parsed(line => nothing, next => line_end + 1));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [B: Region]
+    function readBatch(data: Span[Nat8, B], now: Int64): Either[WireError, Batch] is
+        let size: Index := spanLength(data);
+        if size > batch_bytes_most then
+            return refusedBatch(0, BatchTooLarge());
+        end if;
+        var number: Int64 := 0;
+        var first: Index := 0;
+        case headerOf(data) of
+            when Some(value as header: Parsed) do
+                number := header.line.at;
+                first := header.next;
+            when None do
+                return refusedBatch(0, NoBatchHeader());
+        end case;
+        if first = size then
+            return refusedBatch(1, NoLines());
+        end if;
+        var lines: Buffer[WireLine] := allocateEmpty();
+        var problem: Option[WireError] := None();
+        var count: Index := 0;
+        while (first < size) and (count <= batch_lines_most) do
+            count := count + 1;
+            if count > batch_lines_most then
+                problem := Some(value => WireError(line => count, problem => TooManyBatchLines()));
+            else
+                case lineAt(data, first, now) of
+                    when Left(left as why: WireProblem) do
+                        problem := Some(value => WireError(line => count, problem => why));
+                        count := batch_lines_most + 1;
+                    when Right(right as parsed: Parsed) do
+                        insertBack(&!lines, parsed.line);
+                        first := parsed.next;
+                end case;
+            end if;
+        end while;
+        case problem of
+            when Some(value as error: WireError) do
+                destroyFree(lines);
+                return Left(left => error);
+            when None do
+                return Right(right => Batch(number => number, lines => lines));
+        end case;
+    end;
+
+    function destroyBatch(batch: Batch): Unit is
+        let { number as n: Int64, lines as l: Buffer[WireLine] } := batch;
+        destroyFree(l);
+        return nil;
+    end;
+
+    function batchHeader(number: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, header_start);
+        let digits: String := decimalText(number);
+        writeString(&!out, asSpan(&digits));
+        destroyString(digits);
+        writeByte(&!out, 10);
+        return finalize(out);
+    end;
+
+    generic [R: Region, L: Region, S: Region, T: Region]
+    function writeLine(out: &![StringBuilder, R], at: Int64, level: Span[Nat8, L], source: Span[Nat8, S],
+                       text: Span[Nat8, T]): Bool is
+        if (at < 0) or (at > time_most) then
+            return false;
+        end if;
+        if not (isLevel(level) and isSource(source)) then
+            return false;
+        end if;
+        let digits: String := decimalText(at);
+        writeString(&~out, asSpan(&digits));
+        destroyString(digits);
+        writeByte(&~out, 9);
+        writeString(&~out, level);
+        writeByte(&~out, 9);
+        writeString(&~out, source);
+        writeByte(&~out, 9);
+        var i: Index := 0;
+        while (i < spanLength(text)) and (i < text_most) do
+            let byte: Nat8 := text[i];
+            if ((byte < 32) and (byte /= 9)) or (byte = 127) then
+                writeByte(&~out, ' ');
+            else
+                writeByte(&~out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        writeByte(&~out, 10);
+        return true;
+    end;
+
+    function lineSize(level_bytes: Index, source_bytes: Index, text_bytes: Index): Index is
+        var text: Index := text_bytes;
+        if text > text_most then
+            text := text_most;
+        end if;
+        let fixed: Index := 16;
+        return fixed + ((level_bytes + source_bytes) + text);
+    end;
+end module body.
