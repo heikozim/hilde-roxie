@@ -3,7 +3,7 @@
   <img src="docs/logo/roxie-wordmark-light.svg" alt="ROXIE" width="310" height="100">
 </picture>
 
-ROXIE, Ranked Objects eXtended Index Engine: a log collector written in Hilde on Wolly
+ROXIE: Ranked Objects eXtended Index Engine. A log collector written in Hilde on Wolly
 
 Website: https://hilde-lang.org/wolly/
 
